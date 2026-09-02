@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import re
 import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from playwright.async_api import Error as PlaywrightError, Playwright, async_playwright
@@ -61,6 +63,18 @@ TOPIC_CANDIDATE_SELECTORS = (
     '[role="listbox"] [role="option"]',
     '[role="option"]',
 )
+TUTORIAL_DISMISS_LABELS = (
+    "知道了",
+    "Got it",
+    "Got It",
+)
+COOKIE_REJECT_LABELS = (
+    "拒绝可选 Cookie",
+    "Reject optional cookies",
+    "Decline optional cookies",
+)
+CAPTION_READBACK_POLL_ATTEMPTS = 50
+CAPTION_READBACK_POLL_INTERVAL_MS = 100
 TOPIC_ENTITY_SELECTORS = (
     '[data-e2e*="hashtag" i]',
     '[data-type="hashtag"]',
@@ -72,6 +86,10 @@ TOPIC_CANDIDATE_STABLE_READS = 2
 TOPIC_CANDIDATE_POLL_ATTEMPTS = 300
 TOPIC_ENTITY_STABLE_READS = 3
 TOPIC_ENTITY_POLL_ATTEMPTS = 300
+MUSIC_COPYRIGHT_CHECK_POLL_ATTEMPTS = 90
+MUSIC_COPYRIGHT_CHECK_POLL_INTERVAL_MS = 2_000
+PENDING_CHECKS_CONFIRM_POLL_ATTEMPTS = 20
+PENDING_CHECKS_CONFIRM_POLL_INTERVAL_MS = 500
 UPLOAD_ENTRY_POLL_INTERVAL_MS = 1_000
 UPLOAD_ENTRY_TIMEOUT_SECONDS = 120.0
 CAPTION_EDITOR_POLL_ATTEMPTS = 180
@@ -88,7 +106,11 @@ class TikTokPublishResultUnverified(RuntimeError):
 
 async def _body_text(page) -> str:
     try:
-        return (await page.locator("body").inner_text(timeout=3000)).lower()
+        body = page.locator("body")
+        if inspect.isawaitable(body):
+            body = await body
+        value = await body.inner_text(timeout=3000)
+        return value.lower() if isinstance(value, str) else ""
     except Exception:
         return ""
 
@@ -243,6 +265,7 @@ class TiktokVideo:
         self._schedule_target: TikTokScheduleTarget | None = None
         self.authorized_snapshot_validator = None
         self.schedule_checkpoint_observer = None
+        self.final_action_observer = None
 
     def _emit_form_stage(self, stage: str) -> None:
         observer = self.form_stage_observer
@@ -346,6 +369,34 @@ class TiktokVideo:
         return canonicalize_tiktok_caption(value)
 
     @staticmethod
+    def _log_caption_mismatch(stage: str, actual: str, expected: str) -> None:
+        first_difference = next(
+            (
+                index
+                for index, (actual_char, expected_char) in enumerate(
+                    zip(actual, expected)
+                )
+                if actual_char != expected_char
+            ),
+            min(len(actual), len(expected)),
+        )
+        actual_codes = ",".join(
+            f"U+{ord(char):04X}"
+            for char in actual[first_difference : first_difference + 8]
+        )
+        expected_codes = ",".join(
+            f"U+{ord(char):04X}"
+            for char in expected[first_difference : first_difference + 8]
+        )
+        tiktok_logger.error(
+            f"[tiktok-controlled] {stage} mismatch "
+            f"actual_len={len(actual)} expected_len={len(expected)} "
+            f"first_difference={first_difference} "
+            f"actual_codes={actual_codes or '-'} "
+            f"expected_codes={expected_codes or '-'}"
+        )
+
+    @staticmethod
     def _normalize_topic_label(value: object) -> str:
         text = unicodedata.normalize("NFKC", str(value or "")).strip()
         leading = re.match(r"^#\s*([^\s#]+)", text)
@@ -439,24 +490,47 @@ class TiktokVideo:
     ):
         if editor is None:
             editor = await self._resolve_caption_editor(base)
-        await self._focus_caption_editor(editor)
-        await page.keyboard.press("ControlOrMeta+A")
-        await page.keyboard.press("Backspace")
-        cleared = self._normalize_caption_text(await self._read_editor_text(editor))
-        if cleared:
-            raise TikTokPublishError(
-                "tiktok_caption_clear_failed",
-                "TikTok 文案框未能完全清空",
-            )
-        await page.keyboard.insert_text(plain_caption)
-        actual = self._normalize_caption_text(await self._read_editor_text(editor))
         expected = self._normalize_caption_text(plain_caption)
-        if actual != expected:
-            raise TikTokPublishError(
-                "tiktok_caption_readback_mismatch",
-                "TikTok 正文写入后回读不一致",
+        actual = ""
+        for write_attempt in range(2):
+            await self._focus_caption_editor(editor)
+            await page.keyboard.press("ControlOrMeta+A")
+            await page.keyboard.press("Backspace")
+            cleared = self._normalize_caption_text(
+                await self._read_editor_text(editor)
             )
-        return editor
+            if cleared:
+                raise TikTokPublishError(
+                    "tiktok_caption_clear_failed",
+                    "TikTok 文案框未能完全清空",
+                )
+            await page.keyboard.insert_text(plain_caption)
+            for attempt in range(CAPTION_READBACK_POLL_ATTEMPTS):
+                actual = self._normalize_caption_text(
+                    await self._read_editor_text(editor)
+                )
+                if actual == expected:
+                    return editor
+                if attempt < CAPTION_READBACK_POLL_ATTEMPTS - 1:
+                    await page.wait_for_timeout(CAPTION_READBACK_POLL_INTERVAL_MS)
+            if write_attempt == 0 and not actual:
+                # TikTok may remount the editor while the selected video is
+                # still being prepared.  Only an entirely blank readback is
+                # safe to rebuild automatically; partial or foreign text must
+                # remain a hard stop to avoid duplicated captions.
+                self._emit_form_stage("caption_editor_recovered")
+                tiktok_logger.warning(
+                    "[tiktok] 正文编辑器发生空白重挂载，正在安全重写一次"
+                )
+                await page.wait_for_timeout(500)
+                editor = await self._resolve_caption_editor(base)
+                continue
+            break
+        self._log_caption_mismatch("caption write readback", actual, expected)
+        raise TikTokPublishError(
+            "tiktok_caption_readback_mismatch",
+            "TikTok 正文写入后回读不一致",
+        )
 
     async def _focus_caption_editor(self, editor) -> None:
         focus = getattr(editor, "focus", None)
@@ -472,6 +546,50 @@ class TiktokVideo:
                 "tiktok_caption_focus_failed",
                 "TikTok 文案框无法获得输入焦点",
             ) from exc
+
+    async def _place_caption_caret_at_end(self, editor) -> None:
+        """Put the live contenteditable caret at its real DOM end.
+
+        ``Meta+End`` is not deterministic in TikTok Studio on macOS: when the
+        editor remounts, the shortcut can move the document instead of the
+        contenteditable caret and the next official topic is inserted before
+        the plain caption.  A collapsed DOM range gives us an exact, readable
+        placement contract before typing any hashtag.
+        """
+
+        await self._focus_caption_editor(editor)
+        evaluate = getattr(editor, "evaluate", None)
+        if not callable(evaluate):
+            raise TikTokPublishError(
+                "tiktok_caption_caret_failed",
+                "TikTok 文案框无法确认话题插入位置",
+            )
+        try:
+            placed = await evaluate(
+                """element => {
+                    element.focus();
+                    const selection = element.ownerDocument.defaultView.getSelection();
+                    if (!selection) return false;
+                    const range = element.ownerDocument.createRange();
+                    range.selectNodeContents(element);
+                    range.collapse(false);
+                    selection.removeAllRanges();
+                    selection.addRange(range);
+                    return selection.rangeCount === 1
+                        && selection.isCollapsed
+                        && element.contains(selection.anchorNode);
+                }"""
+            )
+        except Exception as exc:
+            raise TikTokPublishError(
+                "tiktok_caption_caret_failed",
+                "TikTok 文案框无法确认话题插入位置",
+            ) from exc
+        if placed is not True:
+            raise TikTokPublishError(
+                "tiktok_caption_caret_failed",
+                "TikTok 文案框无法确认话题插入位置",
+            )
 
     async def _stable_topic_candidates(
         self,
@@ -651,12 +769,9 @@ class TiktokVideo:
     ) -> list[str]:
         expected: list[str] = []
         for topic in topics:
-            await self._focus_caption_editor(editor)
-            await page.keyboard.press("ControlOrMeta+End")
-            current_text = self._normalize_caption_text(
-                await self._read_editor_text(editor)
-            )
-            if current_text:
+            await self._place_caption_caret_at_end(editor)
+            current_text = await self._read_editor_text(editor)
+            if current_text and not current_text[-1].isspace():
                 await page.keyboard.insert_text(" ")
             await page.keyboard.insert_text(f"#{topic}")
             candidates, labels = await self._stable_topic_candidates(
@@ -698,6 +813,11 @@ class TiktokVideo:
         )
         expected_caption = self._normalize_caption_text(self._caption())
         if actual_caption != expected_caption:
+            self._log_caption_mismatch(
+                "caption snapshot",
+                actual_caption,
+                expected_caption,
+            )
             raise TikTokPublishError(
                 "tiktok_caption_final_mismatch",
                 "TikTok 最终文案回读与唯一组合结果不一致",
@@ -742,12 +862,43 @@ class TiktokVideo:
         editor = await self._fill_plain_caption(page, base, plain_caption)
         self._emit_form_stage("caption_write_verified")
         self._emit_form_stage("topics_started")
-        await self._append_official_topics(
-            page,
-            base,
-            editor,
-            self._topics(),
-        )
+        await self._dismiss_known_tutorial_overlay(page, base)
+        await self._neutralize_cookie_banner(page, base)
+        try:
+            await self._append_official_topics(
+                page,
+                base,
+                editor,
+                self._topics(),
+            )
+        except TikTokPublishError as exc:
+            if exc.error_code != "tiktok_topic_candidate_missing":
+                raise
+            # A freshly remounted editor can accept the raw hashtag before its
+            # official suggestion component is ready.  Rebuild the complete
+            # structured caption once, still before any final action.  The
+            # second miss remains terminal.
+            self._emit_form_stage("topic_candidates_recovered")
+            tiktok_logger.warning(
+                "[tiktok] 话题候选组件暂未就绪，正在安全重建一次"
+            )
+            await page.wait_for_timeout(1000)
+            base = await self._base(page)
+            base, editor = await self._wait_for_caption_editor(page, base)
+            editor = await self._fill_plain_caption(
+                page,
+                base,
+                plain_caption,
+                editor=editor,
+            )
+            await self._dismiss_known_tutorial_overlay(page, base)
+            await self._neutralize_cookie_banner(page, base)
+            await self._append_official_topics(
+                page,
+                base,
+                editor,
+                self._topics(),
+            )
         self._emit_form_stage("topics_verified")
         self._emit_form_stage("visibility_started")
         await self._ensure_public_visibility(page, base)
@@ -766,15 +917,143 @@ class TiktokVideo:
         self._emit_form_stage("post_ready_waiting")
         await self._wait_until_ready(page, base)
         self._emit_form_stage("form_snapshot_started")
-        receipt = await self._verify_form_snapshot(page, base)
+        try:
+            receipt = await self._verify_form_snapshot(page, base)
+        except TikTokPublishError as exc:
+            if exc.error_code != "tiktok_caption_final_mismatch":
+                raise
+            current_editor = await self._resolve_caption_editor(base)
+            actual_caption = self._normalize_caption_text(
+                await self._read_editor_text(current_editor)
+            )
+            topic_only_caption = self._normalize_caption_text(
+                " ".join(f"#{topic}" for topic in self._topics())
+            )
+            if actual_caption != topic_only_caption:
+                # Extra, reordered or otherwise unexpected text is not the
+                # known editor-remount race and must remain a hard failure.
+                raise
+            # The upload editor can be remounted once while TikTok finishes
+            # processing the selected video.  In that race the platform keeps
+            # the topic chips but drops the plain caption.  Re-resolve the live
+            # editor and rebuild the entire structured caption once, still
+            # before any final action.  A second mismatch remains terminal.
+            tiktok_logger.warning(
+                "[tiktok] 发布页文案状态发生重挂载，正在最终动作前重建一次"
+            )
+            base = await self._base(page)
+            base, editor = await self._wait_for_caption_editor(page, base)
+            editor = await self._fill_plain_caption(
+                page,
+                base,
+                plain_caption,
+                editor=editor,
+            )
+            await self._append_official_topics(
+                page,
+                base,
+                editor,
+                self._topics(),
+            )
+            await self._ensure_public_visibility(page, base)
+            await self._wait_until_ready(page, base)
+            receipt = await self._verify_form_snapshot(page, base)
         self._emit_form_stage("form_snapshot_verified")
         return receipt
+
+    async def _dismiss_known_tutorial_overlay(self, page, base) -> bool:
+        get_by_role = getattr(base, "get_by_role", None)
+        if not callable(get_by_role):
+            return False
+        for label in TUTORIAL_DISMISS_LABELS:
+            try:
+                button = get_by_role("button", name=label, exact=True).first
+                if (
+                    not await button.count()
+                    or not await button.is_visible()
+                    or not await button.is_enabled()
+                ):
+                    continue
+                await button.click(timeout=3000)
+                await page.wait_for_timeout(300)
+                self._emit_form_stage("tutorial_dismissed")
+                tiktok_logger.info("[tiktok] 已关闭阻挡发布按钮的新手引导")
+                return True
+            except Exception:
+                continue
+        return False
+
+    async def _neutralize_cookie_banner(self, page, base) -> bool:
+        get_by_role = getattr(base, "get_by_role", None)
+        if not callable(get_by_role):
+            return False
+        for label in COOKIE_REJECT_LABELS:
+            try:
+                button = get_by_role("button", name=label, exact=True).first
+                if not await button.count() or not await button.is_visible():
+                    continue
+                if await button.is_enabled():
+                    await button.click(timeout=3000)
+                else:
+                    neutralized = await button.evaluate(
+                        """
+                        (button) => {
+                          let node = button;
+                          while (node && node !== document.body) {
+                            const text = String(node.innerText || '');
+                            const rect = node.getBoundingClientRect();
+                            const style = window.getComputedStyle(node);
+                            const fixed = style.position === 'fixed' || style.position === 'sticky';
+                            const isCookieBanner = /Cookie|cookie/.test(text)
+                              && fixed
+                              && rect.width >= window.innerWidth * 0.7
+                              && rect.height <= window.innerHeight * 0.5
+                              && rect.bottom >= window.innerHeight - 4;
+                            if (isCookieBanner) {
+                              node.style.setProperty('pointer-events', 'none', 'important');
+                              node.style.setProperty('visibility', 'hidden', 'important');
+                              node.setAttribute('data-oneclick-neutralized', 'cookie-banner');
+                              return true;
+                            }
+                            node = node.parentElement;
+                          }
+                          return false;
+                        }
+                        """
+                    )
+                    if neutralized is not True:
+                        continue
+                await page.wait_for_timeout(200)
+                self._emit_form_stage("cookie_banner_neutralized")
+                tiktok_logger.info("[tiktok] 已解除底部 Cookie 提示条对发布按钮的遮挡")
+                return True
+            except Exception:
+                continue
+        return False
+
+    @staticmethod
+    async def _center_action_button(button) -> None:
+        evaluate = getattr(button, "evaluate", None)
+        if callable(evaluate):
+            await evaluate(
+                "(element) => element.scrollIntoView({block: 'center', inline: 'center'})"
+            )
 
     async def _wait_until_ready(self, page, base) -> None:
         for _ in range(180):
             await self._wait_for_manual_intervention(page)
+            await self._dismiss_known_tutorial_overlay(page, base)
+            await self._neutralize_cookie_banner(page, base)
             try:
-                if await self._final_action_button(base) is not None:
+                button = await self._final_action_button(base)
+                if button is not None:
+                    # TikTok can expose an enabled Post button while the video
+                    # processing overlay still intercepts pointer events.  A
+                    # trial click runs Playwright's full actionability checks
+                    # without dispatching the irreversible action.
+                    await self._center_action_button(button)
+                    await button.click(trial=True, timeout=2000)
+                    self._emit_form_stage("post_actionability_verified")
                     return
             except TikTokPublishError as exc:
                 if (
@@ -783,6 +1062,11 @@ class TiktokVideo:
                     != "tiktok_schedule_final_action_unavailable"
                 ):
                     raise
+            except Exception:
+                # The visible/enabled state is not sufficient while an upload
+                # overlay, animation or remount is still covering the button.
+                # Keep waiting within the existing bounded readiness window.
+                pass
             await asyncio.sleep(2)
         raise TikTokPublishError(
             "tiktok_post_ready_timeout",
@@ -816,6 +1100,90 @@ class TiktokVideo:
                 return
         raise TikTokManualInterventionRequired(
             "TikTok 真人安全确认等待超时；登录态已保留，请重新启动前台发布"
+        )
+
+    @staticmethod
+    def _music_copyright_check_state(body_text: object) -> str:
+        text = unicodedata.normalize("NFKC", str(body_text or ""))
+        lowered = text.casefold()
+        starts = [
+            index
+            for marker in ("音乐版权检查", "music copyright check")
+            if (index := lowered.find(marker.casefold())) >= 0
+        ]
+        if not starts:
+            return "not_present"
+        start = min(starts)
+        ends = [
+            index
+            for marker in (
+                "内容快速检查",
+                "content check lite",
+                "content check",
+            )
+            if (index := lowered.find(marker.casefold(), start + 1)) >= 0
+        ]
+        segment = lowered[start : min(ends) if ends else start + 500]
+        if any(
+            marker in segment
+            for marker in (
+                "未发现问题",
+                "no issues found",
+                "check complete",
+                "check completed",
+                "passed",
+            )
+        ):
+            return "passed"
+        if any(
+            marker in segment
+            for marker in (
+                "正在检查",
+                "checking",
+                "in progress",
+            )
+        ):
+            return "pending"
+        if any(
+            marker in segment
+            for marker in (
+                "发现问题",
+                "issues found",
+                "copyright issue",
+                "failed",
+            )
+        ):
+            return "failed"
+        return "unknown"
+
+    async def _wait_for_music_copyright_check(self, page) -> str:
+        announced = False
+        for attempt in range(MUSIC_COPYRIGHT_CHECK_POLL_ATTEMPTS):
+            await self._wait_for_manual_intervention(page)
+            state = self._music_copyright_check_state(await _body_text(page))
+            if state == "not_present":
+                return state
+            if state == "passed":
+                self._emit_form_stage("copyright_check_verified")
+                return state
+            if state == "failed":
+                raise TikTokPublishError(
+                    "tiktok_copyright_check_failed",
+                    "TikTok 音乐版权检查发现问题，已停止在发布前",
+                )
+            if state == "unknown":
+                raise TikTokPublishError(
+                    "tiktok_copyright_check_unreadable",
+                    "TikTok 音乐版权检查状态无法安全回读，已停止在发布前",
+                )
+            if not announced:
+                announced = True
+                self._emit_form_stage("copyright_check_waiting")
+            if attempt < MUSIC_COPYRIGHT_CHECK_POLL_ATTEMPTS - 1:
+                await page.wait_for_timeout(MUSIC_COPYRIGHT_CHECK_POLL_INTERVAL_MS)
+        raise TikTokPublishError(
+            "tiktok_copyright_check_timeout",
+            "TikTok 音乐版权检查在安全等待时间内没有完成，已停止在发布前",
         )
 
     async def _ensure_public_visibility(self, page, base) -> str:
@@ -908,6 +1276,128 @@ class TiktokVideo:
             return await self._schedule_form.final_button(self._schedule_target)
         return await self._post_button(base)
 
+    async def _click_immediate_post(self, page, button) -> None:
+        observer = self.final_action_observer
+        if not callable(observer):
+            # Compatibility path for isolated/legacy callers.  The controlled
+            # service always binds an observer and therefore uses the verified
+            # mouse-dispatch path below.
+            await button.click(no_wait_after=True)
+            return
+        await button.scroll_into_view_if_needed(timeout=5000)
+        await self._center_action_button(button)
+        # Re-check actionability immediately before consuming the one-time
+        # authorization.  This is non-mutating and catches a late overlay or
+        # remount between the final snapshot and the actual click.
+        await button.click(trial=True, timeout=5000)
+        observer()
+        # The final control currently lives inside TikTok Studio's upload
+        # frame.  A page-level coordinate click can land in the top-level
+        # document even when the locator trial succeeds, producing no DOM
+        # event and no platform response.  Dispatch through the same verified
+        # locator so Playwright preserves the correct frame and element.
+        await button.click(no_wait_after=True, timeout=5000)
+        self._emit_form_stage("final_click_dispatched")
+
+    @staticmethod
+    def _is_pending_checks_confirmation(text: object) -> bool:
+        normalized = unicodedata.normalize("NFKC", str(text or "")).casefold()
+        has_continue_prompt = any(
+            marker in normalized
+            for marker in (
+                "继续发布",
+                "仍要发布",
+                "continue posting",
+                "still post",
+            )
+        )
+        has_pending_check = any(
+            marker in normalized
+            for marker in (
+                "版权检查未完成",
+                "检查尚未完成",
+                "copyright check hasn't finished",
+                "copyright check has not finished",
+                "check is not complete",
+                "checks are not complete",
+            )
+        )
+        return has_continue_prompt and has_pending_check
+
+    async def _confirm_pending_checks_dialog(self, page, base) -> bool:
+        """Confirm TikTok's known post-check warning exactly once.
+
+        TikTok can keep the longer content check running after the music
+        copyright check has passed.  The first Post click then opens a second
+        confirmation instead of submitting.  Only that specifically identified
+        warning is accepted; unrelated dialogs remain untouched.
+        """
+
+        dialog_seen = False
+        confirm_labels = (
+            "立即发布",
+            "Post now",
+            "Post Now",
+            "Post anyway",
+            "Continue posting",
+        )
+        for attempt in range(PENDING_CHECKS_CONFIRM_POLL_ATTEMPTS):
+            await self._wait_for_manual_intervention(page)
+            roots = [base]
+            if page is not base:
+                roots.append(page)
+            matches = []
+            for root in roots:
+                text = await _body_text(root)
+                if not self._is_pending_checks_confirmation(text):
+                    continue
+                dialog_seen = True
+                get_by_role = getattr(root, "get_by_role", None)
+                if not callable(get_by_role):
+                    continue
+                for label in confirm_labels:
+                    candidates = get_by_role("button", name=label, exact=True)
+                    try:
+                        count = min(await candidates.count(), 3)
+                    except Exception:
+                        continue
+                    for index in range(count):
+                        candidate = candidates.nth(index) if count > 1 else candidates
+                        try:
+                            if await candidate.is_visible() and await candidate.is_enabled():
+                                matches.append(candidate)
+                        except Exception:
+                            continue
+            if len(matches) > 1:
+                raise TikTokPublishError(
+                    "tiktok_pending_checks_confirmation_ambiguous",
+                    "TikTok 发布后的继续确认入口不唯一，结果需要人工核对",
+                    outcome_ambiguous=True,
+                )
+            if matches:
+                confirm = matches[0]
+                await confirm.click(trial=True, timeout=5000)
+                self._emit_form_stage("pending_checks_confirmed")
+                await confirm.click(no_wait_after=True, timeout=5000)
+                return True
+            if tiktok_publish_success_signal(
+                url=getattr(page, "url", ""),
+                feedback_text="",
+            ):
+                return False
+            if attempt < PENDING_CHECKS_CONFIRM_POLL_ATTEMPTS - 1:
+                wait_for_timeout = getattr(page, "wait_for_timeout", None)
+                if not callable(wait_for_timeout):
+                    return False
+                await wait_for_timeout(PENDING_CHECKS_CONFIRM_POLL_INTERVAL_MS)
+        if dialog_seen:
+            raise TikTokPublishError(
+                "tiktok_pending_checks_confirmation_missing",
+                "TikTok 已显示继续发布确认，但无法唯一点击“立即发布”，结果需要人工核对",
+                outcome_ambiguous=True,
+            )
+        return False
+
     def _emit_schedule_checkpoint(self, stage: str) -> None:
         observer = self.schedule_checkpoint_observer
         if not callable(observer):
@@ -918,17 +1408,135 @@ class TiktokVideo:
             )
         observer(stage)
 
-    async def _wait_for_publish_result(self, page) -> str:
+    async def _public_content_list_receipt(
+        self,
+        page,
+    ) -> dict[str, str] | None:
+        """Read one exact public Studio row after TikTok accepts the post."""
+
+        normalized_url = str(getattr(page, "url", "") or "").casefold()
+        if not any(
+            route in normalized_url
+            for route in (
+                "/tiktokstudio/content",
+                "/tiktokstudio/posts",
+                "/creator-center/content",
+            )
+        ):
+            return None
+        expected_caption = " ".join(
+            canonicalize_tiktok_caption(self._caption()).split()
+        )
+        expected_handle = str(self.expected_account_reference or "").strip()
+        expected_handle = expected_handle.lstrip("@").casefold()
+        if not expected_caption or not expected_handle:
+            return None
+        anchors = page.locator('a[href*="/video/"]')
+        try:
+            count = min(await anchors.count(), 100)
+        except Exception:
+            return None
+        exact: list[dict[str, str]] = []
+        for index in range(count):
+            anchor = anchors.nth(index)
+            try:
+                if not await anchor.is_visible():
+                    continue
+                caption = " ".join(
+                    canonicalize_tiktok_caption(await anchor.inner_text()).split()
+                )
+                if caption != expected_caption:
+                    continue
+                href = str(await anchor.get_attribute("href") or "").strip()
+                parsed = urlsplit(href)
+                match = re.fullmatch(
+                    r"/@([^/]+)/video/([0-9]{5,})",
+                    parsed.path.rstrip("/"),
+                )
+                if (
+                    parsed.scheme.casefold() != "https"
+                    or (parsed.hostname or "").casefold()
+                    not in {"tiktok.com", "www.tiktok.com"}
+                    or match is None
+                    or match.group(1).casefold() != expected_handle
+                ):
+                    continue
+                row_text = str(
+                    await anchor.evaluate(
+                        """
+                        element => {
+                          let node = element;
+                          let best = '';
+                          while (node && node.parentElement) {
+                            node = node.parentElement;
+                            const links = node.querySelectorAll('a[href*="/video/"]');
+                            if (links.length > 1) break;
+                            if (links.length === 1) best = node.innerText || best;
+                          }
+                          return best;
+                        }
+                        """
+                    )
+                    or ""
+                )
+                row_lines = {
+                    unicodedata.normalize("NFKC", line).strip().casefold()
+                    for line in row_text.splitlines()
+                    if line.strip()
+                }
+                if not row_lines.intersection({"所有人", "公开", "everyone", "public"}):
+                    continue
+            except Exception:
+                continue
+            content_id = match.group(2)
+            exact.append(
+                {
+                    "contentId": content_id,
+                    "contentUrl": (
+                        f"https://www.tiktok.com/@{expected_handle}/video/{content_id}"
+                    ),
+                    "publishedAt": _uploader_shanghai_now().isoformat(),
+                    "visibility": "public",
+                    "evidence": "tiktok_studio_public_content_exact_match",
+                }
+            )
+        if len(exact) == 1:
+            return exact[0]
+        return None
+
+    async def _wait_for_publish_result(self, page) -> str | dict[str, str]:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + PUBLISH_RESULT_TIMEOUT_SECONDS
         while loop.time() < deadline:
             await self._wait_for_manual_intervention(page)
-            feedback = await _feedback_text(page)
+            # TikTok may navigate to the content list while the old upload DOM is
+            # being torn down.  Reading its alerts can then time out even though
+            # the URL already provides the platform acceptance signal.
+            signal = tiktok_publish_success_signal(
+                url=page.url,
+                feedback_text="",
+            )
+            if signal == "platform_content_route":
+                receipt = await self._public_content_list_receipt(page)
+                if receipt is not None:
+                    return receipt
+            elif signal:
+                return signal
+            try:
+                feedback = await _feedback_text(page)
+            except Exception:
+                # One unreadable feedback frame is transient evidence, not a
+                # terminal outcome.  Keep polling until the bounded deadline.
+                feedback = ""
             signal = tiktok_publish_success_signal(
                 url=page.url,
                 feedback_text=feedback,
             )
-            if signal:
+            if signal == "platform_content_route":
+                receipt = await self._public_content_list_receipt(page)
+                if receipt is not None:
+                    return receipt
+            elif signal:
                 return signal
             combined = f"{feedback}\n{await _body_text(page)}".lower()
             if any(
@@ -958,6 +1566,7 @@ class TiktokVideo:
                 "TikTok 最终动作已在本会话消费，禁止再次调用",
             )
         await self._wait_for_manual_intervention(page)
+        await self._wait_for_music_copyright_check(page)
         snapshot = await self._verify_form_snapshot(page, base)
         if self._schedule_target is not None:
             validator = self.authorized_snapshot_validator
@@ -1043,18 +1652,30 @@ class TiktokVideo:
             }
         self._submit_consumed = True
         publish_event("tiktok_final_click", "TikTok 已确认，正在点击 Post")
-        await button.click()
+        await self._click_immediate_post(page, button)
+        await self._confirm_pending_checks_dialog(page, base)
         signal = await self._wait_for_publish_result(page)
+        if isinstance(signal, dict):
+            evidence = str(signal.get("evidence") or "")
+            result = {
+                "status": "published",
+                "evidence": evidence,
+                "formSnapshot": snapshot,
+                "receipt": dict(signal),
+            }
+        else:
+            evidence = signal
+            result = {
+                "status": "published",
+                "evidence": evidence,
+                "formSnapshot": snapshot,
+            }
         publish_event(
             "tiktok_publish_verified",
             "TikTok 发布结果已回读",
-            reference=signal,
+            reference=evidence,
         )
-        return {
-            "status": "published",
-            "evidence": signal,
-            "formSnapshot": snapshot,
-        }
+        return result
 
     async def _publish_formally(self, page, base) -> dict[str, Any]:
         return await self.submit_once(page, base)

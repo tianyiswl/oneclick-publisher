@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from . import account_service, content_bundle, oneclick_capabilities
@@ -43,6 +44,10 @@ from .tiktok_schedule_contract import (
     parse_tiktok_schedule_fields,
     tiktok_irreversible_evidence_sql,
     validate_tiktok_schedule_window,
+)
+from .tiktok_ai_disclosure import (
+    TIKTOK_AI_DISCLOSURE_MODE_CAPTION,
+    append_tiktok_ai_caption_disclosure,
 )
 
 
@@ -643,6 +648,17 @@ def build_controlled_payloads(
         cover_path = _preferred_cover(platform_type, covers)
         display_name = str(account.get("profileName") or account.get("userName") or "")
         disclosure = dict(bundle.get("aiDisclosure") or {})
+        tiktok_ai_disclosure_mode = ""
+        if platform_type == 6 and bool(
+            disclosure.get("containsAiGeneratedContent")
+        ):
+            if disclosure.get("allowPlatformAutoDeclaration") is not True:
+                raise ControlledPublishError(
+                    "tiktok_unsupported_publish_setting",
+                    "TikTok AI 内容缺少允许自动添加的合规披露",
+                )
+            description = append_tiktok_ai_caption_disclosure(description)
+            tiktok_ai_disclosure_mode = TIKTOK_AI_DISCLOSURE_MODE_CAPTION
         payload: dict[str, Any] = {
             "contentType": bundle["contentType"],
             "type": platform_type,
@@ -716,6 +732,7 @@ def build_controlled_payloads(
                         if mode == "platform_form_check"
                         else "formal_public"
                     ),
+                    "tiktokAiDisclosureMode": tiktok_ai_disclosure_mode,
                 }
             )
         elif platform_type == 7 and youtube_settings is not None:
@@ -964,6 +981,9 @@ def _publish_intent_projection(
         ),
         "tiktokExecutionIntent": str(
             payload.get("tiktokExecutionIntent") or ""
+        ),
+        "tiktokAiDisclosureMode": str(
+            payload.get("tiktokAiDisclosureMode") or ""
         ),
         "tiktokVideoSha256": tiktok_video_sha256,
     }
@@ -3489,6 +3509,253 @@ def release_terminal_tiktok_platform_form_check_claim(task_id: int) -> bool:
             raise
 
 
+def _tiktok_reconciliation_video_urls(
+    value: object,
+    *,
+    expected_handle: str,
+) -> list[str]:
+    if not isinstance(value, list) or not value or len(value) > 500:
+        raise ControlledPublishError(
+            "tiktok_reconcile_evidence_invalid",
+            "TikTok 只读核对缺少完整作品列表证据",
+        )
+    normalized: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ControlledPublishError(
+                "tiktok_reconcile_evidence_invalid",
+                "TikTok 只读核对作品链接无效",
+            )
+        try:
+            parsed = urlsplit(item)
+        except (TypeError, ValueError):
+            raise ControlledPublishError(
+                "tiktok_reconcile_evidence_invalid",
+                "TikTok 只读核对作品链接无效",
+            ) from None
+        host = (parsed.hostname or "").lower().rstrip(".")
+        match = re.fullmatch(r"/@([^/]+)/video/([0-9]{5,})", parsed.path.rstrip("/"))
+        if (
+            parsed.scheme.lower() != "https"
+            or host not in {"tiktok.com", "www.tiktok.com"}
+            or match is None
+            or normalize_tiktok_handle(match.group(1)) != expected_handle
+        ):
+            raise ControlledPublishError(
+                "tiktok_reconcile_evidence_invalid",
+                "TikTok 只读核对作品链接与目标账号不一致",
+            )
+        normalized.append(
+            f"https://www.tiktok.com/@{expected_handle}/video/{match.group(2)}"
+        )
+    if len(set(normalized)) != len(normalized):
+        raise ControlledPublishError(
+            "tiktok_reconcile_evidence_invalid",
+            "TikTok 只读核对作品列表包含重复链接",
+        )
+    return normalized
+
+
+def confirm_tiktok_absence_and_release_claim(
+    task_id: int,
+    evidence: Mapping[str, Any],
+    *,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """Release one ambiguous TikTok claim only after fresh, complete absence proof.
+
+    The original failed task and its final-action evidence remain unchanged.  The
+    audit event stores only counts and hashes, never profile HTML or session data.
+    """
+
+    from .database import connect
+
+    proof = _require_mapping(
+        evidence,
+        "tiktok_reconcile_evidence_invalid",
+        "TikTok 只读核对证据必须是对象",
+    )
+    allowed_keys = {
+        "source",
+        "profileUrl",
+        "checkedAt",
+        "reachedEnd",
+        "scopeFingerprint",
+        "visibleVideoUrls",
+        "matchingVideoUrls",
+    }
+    if set(proof) != allowed_keys:
+        raise ControlledPublishError(
+            "tiktok_reconcile_evidence_invalid",
+            "TikTok 只读核对证据字段不完整",
+        )
+    if proof.get("source") != "tiktok_public_profile" or proof.get("reachedEnd") is not True:
+        raise ControlledPublishError(
+            "tiktok_reconcile_evidence_invalid",
+            "TikTok 只读核对必须完成目标主页到底部",
+        )
+    try:
+        checked_at = datetime.fromisoformat(str(proof.get("checkedAt") or "").replace("Z", "+00:00"))
+    except ValueError:
+        raise ControlledPublishError(
+            "tiktok_reconcile_evidence_invalid",
+            "TikTok 只读核对时间无效",
+        ) from None
+    if checked_at.tzinfo is None:
+        raise ControlledPublishError(
+            "tiktok_reconcile_evidence_invalid",
+            "TikTok 只读核对时间必须包含时区",
+        )
+    current = _utc(now)
+    checked_utc = checked_at.astimezone(timezone.utc)
+    if checked_utc > current + timedelta(minutes=1) or current - checked_utc > timedelta(minutes=15):
+        raise ControlledPublishError(
+            "tiktok_reconcile_evidence_stale",
+            "TikTok 只读核对证据已过期，请重新读取作品列表",
+        )
+
+    with connect() as conn:
+        _ensure_tiktok_claim_schema(conn)
+        conn.commit()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            task = conn.execute(
+                "SELECT mode, status, payloadJson FROM publish_tasks WHERE id = ?",
+                (int(task_id),),
+            ).fetchone()
+            claim = conn.execute(
+                "SELECT id, scopeFingerprint, mode, state "
+                "FROM tiktok_controlled_execution_claims WHERE taskId = ?",
+                (int(task_id),),
+            ).fetchone()
+            if (
+                task is None
+                or claim is None
+                or str(task["mode"] or "") != "oneclick_publish"
+                or str(task["status"] or "") not in {"failed", "partial_failed"}
+                or str(claim["mode"] or "") != "formal"
+                or str(claim["state"] or "") != "started"
+            ):
+                raise ControlledPublishError(
+                    "tiktok_reconcile_task_invalid",
+                    "TikTok 只读核对仅允许结果不明的正式终态任务",
+                )
+            try:
+                raw_payloads = json.loads(str(task["payloadJson"] or "[]"))
+            except json.JSONDecodeError:
+                raise ControlledPublishError(
+                    "tiktok_reconcile_task_invalid",
+                    "TikTok 只读核对无法读取原任务快照",
+                ) from None
+            payloads = [
+                dict(item) for item in raw_payloads if isinstance(item, Mapping)
+            ] if isinstance(raw_payloads, list) else []
+            if len(payloads) != 1 or int(payloads[0].get("type") or 0) != 6:
+                raise ControlledPublishError(
+                    "tiktok_reconcile_task_invalid",
+                    "TikTok 只读核对缺少唯一平台任务快照",
+                )
+            fingerprint = scope_fingerprint(payloads)
+            if (
+                str(claim["scopeFingerprint"] or "") != fingerprint
+                or str(proof.get("scopeFingerprint") or "") != fingerprint
+            ):
+                raise ControlledPublishError(
+                    "tiktok_reconcile_evidence_invalid",
+                    "TikTok 只读核对与原发布范围不一致",
+                )
+            irreversible = tiktok_irreversible_evidence_sql("task.id")
+            final_action = conn.execute(
+                f"SELECT {irreversible} AS present FROM publish_tasks AS task WHERE task.id = ?",
+                (int(task_id),),
+            ).fetchone()
+            if final_action is None or not bool(final_action["present"]):
+                raise ControlledPublishError(
+                    "tiktok_reconcile_task_invalid",
+                    "TikTok 原任务没有需要核对的最终动作证据",
+                )
+            expected_handle = normalize_tiktok_handle(
+                payloads[0].get("tiktokExpectedAccountReference")
+            )
+            if (
+                not expected_handle
+                or normalize_tiktok_handle(proof.get("profileUrl")) != expected_handle
+            ):
+                raise ControlledPublishError(
+                    "tiktok_reconcile_evidence_invalid",
+                    "TikTok 只读核对主页与原任务账号不一致",
+                )
+            visible_urls = _tiktok_reconciliation_video_urls(
+                proof.get("visibleVideoUrls"),
+                expected_handle=expected_handle,
+            )
+            matching = proof.get("matchingVideoUrls")
+            if not isinstance(matching, list):
+                raise ControlledPublishError(
+                    "tiktok_reconcile_evidence_invalid",
+                    "TikTok 只读核对匹配结果无效",
+                )
+            if matching:
+                matched_urls = _tiktok_reconciliation_video_urls(
+                    matching,
+                    expected_handle=expected_handle,
+                )
+                if not set(matched_urls).issubset(set(visible_urls)):
+                    raise ControlledPublishError(
+                        "tiktok_reconcile_evidence_invalid",
+                        "TikTok 匹配作品不属于本次可见列表",
+                    )
+                raise ControlledPublishError(
+                    "tiktok_reconcile_content_present",
+                    "TikTok 主页已经存在目标作品，已阻止重复发布",
+                )
+            deleted = conn.execute(
+                "DELETE FROM tiktok_controlled_execution_claims "
+                "WHERE id = ? AND taskId = ? AND mode = 'formal' AND state = 'started'",
+                (int(claim["id"]), int(task_id)),
+            )
+            if deleted.rowcount != 1:
+                raise ControlledPublishError(
+                    "tiktok_reconcile_claim_changed",
+                    "TikTok 重试保护状态已变化，请重新核对",
+                )
+            detail = {
+                "source": "tiktok_public_profile",
+                "profileHandle": expected_handle,
+                "checkedAt": checked_utc.isoformat(),
+                "visibleVideoCount": len(visible_urls),
+                "matchingVideoCount": 0,
+                "scopeFingerprint": fingerprint,
+            }
+            conn.execute(
+                "INSERT INTO publish_task_events "
+                "(taskId, level, eventType, message, detailJson, createdAt) "
+                "VALUES (?, 'info', 'tiktok_publish_absence_confirmed', ?, ?, ?)",
+                (
+                    int(task_id),
+                    "TikTok 目标主页完整列表未出现本次作品，已允许一次重新发布",
+                    json.dumps(
+                        detail,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    current.isoformat(),
+                ),
+            )
+            conn.commit()
+            return {
+                "taskId": int(task_id),
+                "status": "confirmed_not_published",
+                "retryAllowed": True,
+                "scopeFingerprint": fingerprint,
+                "visibleVideoCount": len(visible_urls),
+            }
+        except Exception:
+            conn.rollback()
+            raise
+
+
 def create_direct_authorization_schema(conn: sqlite3.Connection) -> None:
     """创建对话直发的一次性授权表。
 
@@ -3988,9 +4255,32 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
         for platform in platforms
         if int(platform.get("platformType") or 0) == 6
     }
+    tiktok_success_event_index = max(
+        _latest_event_index("tiktok_scheduled_readback_confirmed"),
+        _latest_event_index("tiktok_scheduled_accepted"),
+        _latest_event_index("tiktok_published_readback_confirmed"),
+        _latest_event_index("tiktok_platform_accepted"),
+    )
+    tiktok_ambiguous_event_index = _latest_event_index(
+        "tiktok_publish_outcome_ambiguous"
+    )
+    tiktok_has_later_success = bool(
+        tiktok_receipt_phases.intersection(
+            {
+                "scheduled_readback_confirmed",
+                "scheduled_accepted",
+                "published_readback_confirmed",
+                "platform_accepted",
+            }
+        )
+        or tiktok_success_event_index > tiktok_ambiguous_event_index
+    )
     if (
-        "tiktok_publish_outcome_ambiguous" in event_types
-        or "ambiguous" in tiktok_receipt_phases
+        "ambiguous" in tiktok_receipt_phases
+        or (
+            tiktok_ambiguous_event_index >= 0
+            and not tiktok_has_later_success
+        )
     ):
         stage = "ambiguous"
         user_action = None

@@ -249,6 +249,60 @@ class YouTubeVideoManagementClientTests(unittest.TestCase):
         self.assertEqual(body["status"]["license"], "youtube")
         self.assertEqual(result.publish_at, "2026-08-28T01:00:00Z")
 
+    def test_visibility_timeout_accepts_only_exact_readback_confirmation(self) -> None:
+        class TimeoutAfterMutationTransport(FakeManagementTransport):
+            def put(self, url: str, **kwargs) -> FakeResponse:
+                self.put_calls.append({"url": url, **kwargs})
+                raise TimeoutError("response timed out after server mutation")
+
+        transport = TimeoutAfterMutationTransport(
+            get_responses=[
+                FakeResponse(200, video_status_response("private")),
+                FakeResponse(200, video_status_response("public")),
+            ]
+        )
+
+        result = YouTubeVideoManagementClient(transport).apply_visibility(
+            "access-secret",
+            video_id="video-1",
+            target_visibility="public",
+            publish_at=None,
+            made_for_kids=False,
+        )
+
+        self.assertEqual(result.video_id, "video-1")
+        self.assertEqual(result.privacy_status, "public")
+        self.assertEqual(len(transport.get_calls), 2)
+        self.assertEqual(len(transport.put_calls), 1)
+
+    def test_visibility_timeout_still_fails_when_readback_did_not_change(self) -> None:
+        class TimeoutBeforeMutationTransport(FakeManagementTransport):
+            def put(self, url: str, **kwargs) -> FakeResponse:
+                self.put_calls.append({"url": url, **kwargs})
+                raise TimeoutError("request timed out before server mutation")
+
+        transport = TimeoutBeforeMutationTransport(
+            get_responses=[
+                FakeResponse(200, video_status_response("private")),
+                FakeResponse(200, video_status_response("private")),
+            ]
+        )
+
+        with self.assertRaisesRegex(
+            YouTubeOfficialPublishError,
+            "^youtube_visibility_update_failed$",
+        ):
+            YouTubeVideoManagementClient(transport).apply_visibility(
+                "access-secret",
+                video_id="video-1",
+                target_visibility="public",
+                publish_at=None,
+                made_for_kids=False,
+            )
+
+        self.assertEqual(len(transport.get_calls), 2)
+        self.assertEqual(len(transport.put_calls), 1)
+
     def test_thumbnail_posts_media_to_exact_video_id(self) -> None:
         transport = FakeManagementTransport(
             post_responses=[FakeResponse(200, {})]

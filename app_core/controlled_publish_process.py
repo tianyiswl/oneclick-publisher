@@ -100,6 +100,8 @@ def _formal_payloads_from_preflight(
             and payload.get("youtubeOfficialApi") is not True
         ):
             payload["overseasVideoPublishConfirmed"] = True
+        if platform_type == 6 and payload.get("aiGenerated") is True:
+            payload["aiDeclarationExplicitlyConfirmed"] = True
         if platform_type == 8:
             # Instagram type 8 keeps its internal compatibility evidence.  It
             # is derived from the one-time authorization, never public input.

@@ -384,6 +384,49 @@ class TikTokPublishContractTests(unittest.TestCase):
                     self.payload(**changes),
                 )
 
+    def test_ai_caption_disclosure_contract_is_explicit_and_fail_closed(self) -> None:
+        disclosed_body = "本地预检正文。\n\nAI-generated content."
+        prepared = self.validate(
+            self.payload(
+                description=disclosed_body,
+                aiGenerated=True,
+                aiDeclarationExplicitlyConfirmed=False,
+                tiktokAiDisclosureMode="caption",
+            )
+        )
+
+        self.assertEqual(prepared["body"], disclosed_body)
+        self.assertEqual(prepared["aiDisclosureMode"], "caption")
+
+        invalid_payloads = (
+            self.payload(
+                aiGenerated=True,
+                tiktokAiDisclosureMode="caption",
+            ),
+            self.payload(
+                description=disclosed_body,
+                aiGenerated=True,
+                tiktokAiDisclosureMode="text",
+            ),
+            self.payload(
+                description=disclosed_body,
+                aiGenerated=True,
+                aiDeclarationExplicitlyConfirmed=True,
+                tiktokAiDisclosureMode="caption",
+            ),
+            self.payload(
+                description=disclosed_body,
+                aiGenerated=False,
+                tiktokAiDisclosureMode="caption",
+            ),
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                self.assert_error_code(
+                    "tiktok_unsupported_publish_setting",
+                    payload,
+                )
+
     def test_immediate_schedule_defaults_are_required_and_type_strict(self) -> None:
         without_enable_timer = self.payload()
         without_enable_timer.pop("enableTimer")

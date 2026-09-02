@@ -102,14 +102,18 @@ class ControlledPublishTests(unittest.TestCase):
         )
         return manifest
 
-    def _tiktok_bundle(self, root: Path, *, body: str = "TikTok body") -> Path:
+    def _tiktok_bundle(
+        self,
+        root: Path,
+        *,
+        body: str = "TikTok body",
+        ai_disclosure: dict | None = None,
+    ) -> Path:
         (root / "tiktok.mp4").write_bytes(b"tiktok-video")
         (root / "tiktok-cover.png").write_bytes(b"tiktok-cover")
         (root / "body.md").write_text(body, encoding="utf-8")
         manifest = root / "manifest.json"
-        manifest.write_text(
-            json.dumps(
-                {
+        manifest_data = {
                     "schemaVersion": "oneclick-content/v1",
                     "contentType": "video",
                     "title": "TikTok title",
@@ -127,9 +131,11 @@ class ControlledPublishTests(unittest.TestCase):
                     },
                     "debugDryRun": True,
                     "publishAllowed": False,
-                },
-                ensure_ascii=False,
-            ),
+                }
+        if ai_disclosure is not None:
+            manifest_data["aiDisclosure"] = ai_disclosure
+        manifest.write_text(
+            json.dumps(manifest_data, ensure_ascii=False),
             encoding="utf-8",
         )
         return manifest
@@ -1018,6 +1024,135 @@ class ControlledPublishTests(unittest.TestCase):
         self.assertEqual(results, [False] * len(evidence))
         self.assertEqual(remaining, len(evidence))
 
+    def test_tiktok_confirmed_absent_readback_releases_exact_ambiguous_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            database,
+            "DB_PATH",
+            Path(temporary) / "database.db",
+        ):
+            database.ensure_schema()
+            task = self._seed_tiktok_claim_for_release_test(
+                task_mode="oneclick_publish",
+                claim_mode="formal",
+                error_code="tiktok_publish_outcome_unknown",
+                event_type="tiktok_publish_outcome_ambiguous",
+            )
+            with database.connect() as conn:
+                payloads = json.loads(
+                    conn.execute(
+                        "SELECT payloadJson FROM publish_tasks WHERE id = ?",
+                        (int(task["id"]),),
+                    ).fetchone()["payloadJson"]
+                )
+                fingerprint = scope_fingerprint(payloads)
+                conn.execute(
+                    "UPDATE tiktok_controlled_execution_claims "
+                    "SET scopeFingerprint = ? WHERE taskId = ?",
+                    (fingerprint, int(task["id"])),
+                )
+                conn.commit()
+            reconcile = getattr(
+                controlled_publish,
+                "confirm_tiktok_absence_and_release_claim",
+                None,
+            )
+            self.assertIsNotNone(reconcile)
+            result = reconcile(
+                int(task["id"]),
+                {
+                    "source": "tiktok_public_profile",
+                    "profileUrl": "https://www.tiktok.com/@expected.user",
+                    "checkedAt": "2026-09-02T12:00:00+00:00",
+                    "reachedEnd": True,
+                    "scopeFingerprint": fingerprint,
+                    "visibleVideoUrls": [
+                        "https://www.tiktok.com/@expected.user/video/1234567890"
+                    ],
+                    "matchingVideoUrls": [],
+                },
+                now=datetime(2026, 9, 2, 12, 5, tzinfo=timezone.utc),
+            )
+            with database.connect() as conn:
+                claims = conn.execute(
+                    "SELECT COUNT(*) FROM tiktok_controlled_execution_claims "
+                    "WHERE taskId = ?",
+                    (int(task["id"]),),
+                ).fetchone()[0]
+                event = conn.execute(
+                    "SELECT eventType, detailJson FROM publish_task_events "
+                    "WHERE taskId = ? ORDER BY id DESC LIMIT 1",
+                    (int(task["id"]),),
+                ).fetchone()
+
+        self.assertEqual(result["status"], "confirmed_not_published")
+        self.assertTrue(result["retryAllowed"])
+        self.assertEqual(claims, 0)
+        self.assertEqual(event["eventType"], "tiktok_publish_absence_confirmed")
+        self.assertNotIn("expected.user/video", event["detailJson"])
+
+    def test_tiktok_present_readback_preserves_ambiguous_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            database,
+            "DB_PATH",
+            Path(temporary) / "database.db",
+        ):
+            database.ensure_schema()
+            task = self._seed_tiktok_claim_for_release_test(
+                task_mode="oneclick_publish",
+                claim_mode="formal",
+                error_code="tiktok_publish_outcome_unknown",
+                event_type="tiktok_publish_outcome_ambiguous",
+            )
+            with database.connect() as conn:
+                payloads = json.loads(
+                    conn.execute(
+                        "SELECT payloadJson FROM publish_tasks WHERE id = ?",
+                        (int(task["id"]),),
+                    ).fetchone()["payloadJson"]
+                )
+                fingerprint = scope_fingerprint(payloads)
+                conn.execute(
+                    "UPDATE tiktok_controlled_execution_claims "
+                    "SET scopeFingerprint = ? WHERE taskId = ?",
+                    (fingerprint, int(task["id"])),
+                )
+                conn.commit()
+            reconcile = getattr(
+                controlled_publish,
+                "confirm_tiktok_absence_and_release_claim",
+                None,
+            )
+            self.assertIsNotNone(reconcile)
+            matching_url = (
+                "https://www.tiktok.com/@expected.user/video/1234567890"
+            )
+            with self.assertRaises(ControlledPublishError) as raised:
+                reconcile(
+                    int(task["id"]),
+                    {
+                        "source": "tiktok_public_profile",
+                        "profileUrl": "https://www.tiktok.com/@expected.user",
+                        "checkedAt": "2026-09-02T12:00:00+00:00",
+                        "reachedEnd": True,
+                        "scopeFingerprint": fingerprint,
+                        "visibleVideoUrls": [matching_url],
+                        "matchingVideoUrls": [matching_url],
+                    },
+                    now=datetime(2026, 9, 2, 12, 5, tzinfo=timezone.utc),
+                )
+            with database.connect() as conn:
+                claims = conn.execute(
+                    "SELECT COUNT(*) FROM tiktok_controlled_execution_claims "
+                    "WHERE taskId = ?",
+                    (int(task["id"]),),
+                ).fetchone()[0]
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "tiktok_reconcile_content_present",
+        )
+        self.assertEqual(claims, 1)
+
     def test_two_tiktok_formal_authorizations_compete_for_one_atomic_claim(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, patch.object(
             database,
@@ -1819,6 +1954,47 @@ class ControlledPublishTests(unittest.TestCase):
                 "tiktok_unsupported_publish_setting",
             )
 
+    def test_tiktok_ai_manifest_uses_explicit_caption_disclosure_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = self._tiktok_bundle(
+                root,
+                ai_disclosure={
+                    "containsAiGeneratedContent": True,
+                    "contentKinds": ["text", "image", "video", "audio"],
+                    "assetPaths": ["tiktok.mp4"],
+                    "allowPlatformAutoDeclaration": True,
+                },
+            )
+
+            payload = build_controlled_payloads(
+                self._tiktok_request(manifest),
+                accounts=[self._tiktok_account()],
+            )[0]
+
+        self.assertTrue(payload["aiGenerated"])
+        self.assertFalse(payload["aiDeclarationExplicitlyConfirmed"])
+        self.assertEqual(payload["tiktokAiDisclosureMode"], "caption")
+        self.assertTrue(payload["description"].endswith("\n\nAI-generated content."))
+        self.assertEqual(payload["description"].count("AI-generated content."), 1)
+
+    def test_tiktok_ai_caption_disclosure_is_bound_into_fingerprint(self) -> None:
+        base = [
+            {
+                "type": 6,
+                "accountIds": [61],
+                "description": "Body\n\nAI-generated content.",
+                "aiGenerated": True,
+                "tiktokAiDisclosureMode": "caption",
+            }
+        ]
+        missing_mode = [{**base[0], "tiktokAiDisclosureMode": ""}]
+
+        self.assertNotEqual(
+            scope_fingerprint(base),
+            scope_fingerprint(missing_mode),
+        )
+
     def test_tiktok_fingerprint_binds_content_video_identity_and_execution_intent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2058,6 +2234,42 @@ class ControlledPublishTests(unittest.TestCase):
         self.assertNotIn("expected.user", waiting["userAction"]["message"])
         self.assertNotIn("session", waiting["userAction"]["message"])
         self.assertEqual(ambiguous["stage"], "ambiguous")
+
+    def test_tiktok_later_exact_readback_overrides_earlier_ambiguous_stage(self) -> None:
+        projected = project_task(
+            {
+                "id": 611,
+                "taskNo": "T611",
+                "mode": "oneclick_publish",
+                "status": "success",
+                "payloadJson": json.dumps(
+                    [{"type": 6, "accountIds": [61]}], ensure_ascii=False
+                ),
+                "items": [
+                    {
+                        "platformType": 6,
+                        "status": "success",
+                        "receiptJson": json.dumps(
+                            {
+                                "phase": "published_readback_confirmed",
+                                "contentId": "1234567890123456789",
+                                "contentUrl": (
+                                    "https://www.tiktok.com/@expected.user/video/"
+                                    "1234567890123456789"
+                                ),
+                                "publishedAt": "2026-09-02T23:21:00+08:00",
+                            }
+                        ),
+                    }
+                ],
+                "events": [
+                    {"eventType": "tiktok_publish_outcome_ambiguous"},
+                    {"eventType": "tiktok_published_readback_confirmed"},
+                ],
+            }
+        )
+
+        self.assertEqual(projected["stage"], "published_readback_confirmed")
 
     def test_tiktok_project_task_projects_canonical_scheduled_at(self) -> None:
         projected = project_task(

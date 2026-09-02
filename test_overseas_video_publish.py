@@ -11,7 +11,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 from zoneinfo import ZoneInfo
 
 from app_core import overseas_tiktok_publish, overseas_video_publish
@@ -179,7 +179,8 @@ class FakeTikTokLeaf:
         del name
         return None
 
-    async def click(self) -> None:
+    async def click(self, *args, **kwargs) -> None:
+        del args, kwargs
         if self.on_click is not None:
             self.on_click()
 
@@ -200,12 +201,19 @@ class FakeTikTokEditor(FakeTikTokLeaf):
         self.entity_snapshots: list[list[str]] | None = None
         self.active_entity_snapshot: list[str] | None = None
         self.normalized_text_before_topics: str | None = None
+        self.caret_end_placements = 0
 
     async def click(self) -> None:
         self.page.active_editor = self
 
     async def focus(self) -> None:
         self.page.active_editor = self
+
+    async def evaluate(self, expression: str):
+        if "selectNodeContents" in expression and "collapse(false)" in expression:
+            self.caret_end_placements += 1
+            return True
+        return None
 
     def locator(self, selector: str) -> FakeTikTokCollection:
         if self.entity_snapshots is not None:
@@ -239,6 +247,8 @@ class FakeTikTokKeyboard:
         elif key == "Backspace" and self.select_all:
             if not editor.clear_blocked:
                 editor.text = ""
+                if getattr(self.page, "clear_entities_on_backspace", False):
+                    editor.entity_nodes = []
             self.select_all = False
         elif key == "ControlOrMeta+End":
             self.select_all = False
@@ -263,16 +273,24 @@ class FakeTikTokCandidate(FakeTikTokLeaf):
         entity_values: list[str] | None = None,
         mutate_text: str | None = None,
         focused: bool = False,
+        append_trailing_space: bool = False,
+        mutate_text_once: bool = False,
     ) -> None:
         self.clicked = False
+        self.click_count = 0
         self.focused = focused
 
         def select() -> None:
             self.clicked = True
+            self.click_count += 1
             if entity_values is not None:
                 page.editor.entity_nodes.extend(entity_values)
-            if mutate_text is not None:
+            if mutate_text is not None and (
+                not mutate_text_once or self.click_count == 1
+            ):
                 page.editor.text = mutate_text
+            if append_trailing_space:
+                page.editor.text += " "
 
         super().__init__(label, visible=True, on_click=select)
 
@@ -307,6 +325,7 @@ class FakeTikTokPage:
         clear_blocked: bool = False,
     ) -> None:
         self.url = tiktok_uploader.UPLOAD_URL
+        self.clear_entities_on_backspace = False
         self.active_editor: FakeTikTokEditor | None = None
         self.current_topic = ""
         self.candidates: dict[str, list[FakeTikTokCandidate]] = {}
@@ -530,6 +549,9 @@ class TikTokFormAdapterTests(unittest.TestCase):
         )
         app._upload_file = AsyncMock(return_value=None)
         app._wait_until_ready = AsyncMock(return_value=None)
+        app._wait_for_music_copyright_check = AsyncMock(
+            return_value="not_present"
+        )
         app._ensure_public_visibility = AsyncMock(return_value="public")
         app._post_button = AsyncMock(return_value=FakeTikTokLeaf(text="Post"))
         return app
@@ -1240,6 +1262,8 @@ class TikTokFormAdapterTests(unittest.TestCase):
         *labels: str,
         entity_values: list[str] | None = None,
         mutate_text: str | None = None,
+        append_trailing_space: bool = False,
+        mutate_text_once: bool = False,
     ) -> None:
         values = [topic] if entity_values is None else entity_values
         page.candidates[topic] = [
@@ -1248,6 +1272,8 @@ class TikTokFormAdapterTests(unittest.TestCase):
                 label,
                 entity_values=list(values),
                 mutate_text=mutate_text,
+                append_trailing_space=append_trailing_space,
+                mutate_text_once=mutate_text_once,
             )
             for label in labels
         ]
@@ -1273,6 +1299,7 @@ class TikTokFormAdapterTests(unittest.TestCase):
         app._upload_file.assert_awaited_once_with(page, page.base)
         reveal.assert_not_awaited()
         self.assertEqual(page.editor.normalized_text_before_topics, "Title\n\nBody")
+        self.assertEqual(page.editor.caret_end_placements, 2)
         self.assertEqual(receipt["topicEntities"], ["AI", "效率"])
         self.assertEqual(receipt["plainCaption"], "Title\n\nBody")
         self.assertEqual(receipt["visibility"], "public")
@@ -1295,6 +1322,97 @@ class TikTokFormAdapterTests(unittest.TestCase):
             ],
         )
 
+    def test_topic_insertion_reuses_platform_trailing_space(self) -> None:
+        page = FakeTikTokPage()
+        self.add_candidates(
+            page,
+            "AI",
+            "#AI",
+            append_trailing_space=True,
+        )
+        self.add_candidates(
+            page,
+            "效率",
+            "#效率",
+            append_trailing_space=True,
+        )
+        app = self.uploader(tags=["AI", "效率"])
+
+        with patch.object(
+            tiktok_uploader,
+            "_body_text",
+            new=AsyncMock(return_value=""),
+        ):
+            receipt = asyncio.run(app.prepare_form(page, page.base))
+
+        self.assertEqual(
+            tiktok_uploader.canonicalize_tiktok_caption(page.editor.text),
+            "Title\n\nBody #AI #效率",
+        )
+        self.assertEqual(receipt["finalCaption"], "Title\n\nBody #AI #效率")
+
+    def test_prepare_form_rebuilds_caption_once_after_platform_drops_plain_text(self) -> None:
+        page = FakeTikTokPage()
+        page.clear_entities_on_backspace = True
+        self.add_candidates(
+            page,
+            "AI",
+            "#AI",
+            mutate_text="#AI",
+            mutate_text_once=True,
+        )
+        app = self.uploader(tags=["AI"])
+
+        with patch.object(
+            tiktok_uploader,
+            "_body_text",
+            new=AsyncMock(return_value=""),
+        ):
+            receipt = asyncio.run(app.prepare_form(page, page.base))
+
+        candidate = page.candidates["AI"][0]
+        self.assertEqual(candidate.click_count, 2)
+        self.assertEqual(
+            tiktok_uploader.canonicalize_tiktok_caption(page.editor.text),
+            "Title\n\nBody #AI",
+        )
+        self.assertEqual(receipt["finalCaption"], "Title\n\nBody #AI")
+
+    def test_prepare_form_rebuilds_once_after_transient_topic_candidates(self) -> None:
+        page = FakeTikTokPage(editor_text="")
+        app = self.uploader(tags=["AI"])
+        app._base = AsyncMock(return_value=page.base)
+        app._wait_for_caption_editor = AsyncMock(
+            return_value=(page.base, page.editor)
+        )
+        app._fill_plain_caption = AsyncMock(return_value=page.editor)
+        app._append_official_topics = AsyncMock(
+            side_effect=[
+                TikTokPublishError(
+                    "tiktok_topic_candidate_missing",
+                    "candidate not ready",
+                ),
+                ["AI"],
+            ]
+        )
+        app._verify_form_snapshot = AsyncMock(
+            return_value={
+                "plainCaption": "Title\n\nBody",
+                "topicEntities": ["AI"],
+                "visibility": "public",
+                "finalCaption": "Title\n\nBody #AI",
+            }
+        )
+        stages: list[str] = []
+        app.form_stage_observer = stages.append
+
+        receipt = asyncio.run(app.prepare_form(page, page.base))
+
+        self.assertEqual(app._append_official_topics.await_count, 2)
+        self.assertEqual(app._fill_plain_caption.await_count, 2)
+        self.assertIn("topic_candidates_recovered", stages)
+        self.assertEqual(receipt["topicEntities"], ["AI"])
+
     def test_caption_writing_focuses_editor_without_pointer_click(self) -> None:
         page = FakeTikTokPage()
         page.editor.click = AsyncMock(side_effect=TimeoutError("covered"))
@@ -1313,6 +1431,74 @@ class TikTokFormAdapterTests(unittest.TestCase):
         page.editor.focus.assert_awaited()
         page.editor.click.assert_not_awaited()
         self.assertEqual(receipt["plainCaption"], "Title\n\nBody")
+
+    def test_caption_write_waits_for_delayed_editor_readback(self) -> None:
+        page = FakeTikTokPage()
+        page.editor.inner_text = AsyncMock(
+            side_effect=[
+                "",
+                "Title",
+                "Title\n\nBody",
+            ]
+        )
+        app = self.uploader(tags=[])
+
+        editor = asyncio.run(
+            app._fill_plain_caption(
+                page,
+                page.base,
+                "Title\n\nBody",
+                editor=page.editor,
+            )
+        )
+
+        self.assertIs(editor, page.editor)
+        self.assertEqual(page.editor.inner_text.await_count, 3)
+
+    def test_caption_write_retries_once_after_blank_editor_remount(self) -> None:
+        page = FakeTikTokPage(editor_text="")
+        stale_editor = page.editor
+        stale_editor.inner_text = AsyncMock(return_value="")
+        replacement = FakeTikTokEditor(page, text="")
+        app = self.uploader(tags=[])
+        app._resolve_caption_editor = AsyncMock(return_value=replacement)
+
+        editor = asyncio.run(
+            app._fill_plain_caption(
+                page,
+                page.base,
+                "Title\n\nBody",
+                editor=stale_editor,
+            )
+        )
+
+        self.assertIs(editor, replacement)
+        app._resolve_caption_editor.assert_awaited_once_with(page.base)
+        self.assertEqual(replacement.text, "Title\n\nBody")
+
+    def test_caption_write_never_retries_partial_mismatch(self) -> None:
+        page = FakeTikTokPage(editor_text="")
+        page.editor.inner_text = AsyncMock(
+            side_effect=[""] + ["partial"] * tiktok_uploader.CAPTION_READBACK_POLL_ATTEMPTS
+        )
+        app = self.uploader(tags=[])
+        app._resolve_caption_editor = AsyncMock()
+
+        with self.assertRaises(TikTokPublishError) as raised:
+            asyncio.run(
+                app._fill_plain_caption(
+                    page,
+                    page.base,
+                    "Title\n\nBody",
+                    editor=page.editor,
+                )
+            )
+
+        self.assertEqual(
+            raised.exception.error_code,
+            "tiktok_caption_readback_mismatch",
+        )
+        app._resolve_caption_editor.assert_not_awaited()
 
     def test_post_ready_wait_uses_the_same_chinese_button_contract(self) -> None:
         button = FakeTikTokLeaf("发布")
@@ -1940,6 +2126,181 @@ class TikTokFormAdapterTests(unittest.TestCase):
 
         reveal.assert_awaited_once_with(page)
 
+    def test_post_ready_wait_requires_trial_click_actionability(self) -> None:
+        class DelayedActionableButton:
+            def __init__(self) -> None:
+                self.trials = 0
+
+            async def click(self, *, trial: bool = False, timeout: int = 0) -> None:
+                self.assert_trial(trial, timeout)
+                self.trials += 1
+                if self.trials == 1:
+                    raise RuntimeError("upload overlay intercepts pointer")
+
+            @staticmethod
+            def assert_trial(trial: bool, timeout: int) -> None:
+                if trial is not True or timeout != 2000:
+                    raise AssertionError("readiness must use a bounded trial click")
+
+        page = FakeTikTokPage()
+        button = DelayedActionableButton()
+        app = self.uploader(tags=[])
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+        app._final_action_button = AsyncMock(return_value=button)
+
+        with patch.object(
+            tiktok_uploader.asyncio,
+            "sleep",
+            new=AsyncMock(return_value=None),
+        ):
+            asyncio.run(
+                TiktokVideo._wait_until_ready(app, page, SimpleNamespace())
+            )
+
+        self.assertEqual(button.trials, 2)
+        self.assertEqual(app._final_action_button.await_count, 2)
+
+    def test_post_ready_wait_dismisses_known_tutorial_before_trial(self) -> None:
+        order: list[str] = []
+
+        class TutorialButton:
+            async def count(self) -> int:
+                return 1
+
+            async def is_visible(self) -> bool:
+                return True
+
+            async def is_enabled(self) -> bool:
+                return True
+
+            async def click(self, *, timeout: int = 0) -> None:
+                if timeout != 3000:
+                    raise AssertionError("tutorial dismissal must be bounded")
+                order.append("tutorial")
+
+        class ActionButton:
+            async def evaluate(self, _expression: str) -> None:
+                order.append("center")
+
+            async def click(self, *, trial: bool = False, timeout: int = 0) -> None:
+                if order[:2] != ["tutorial", "center"]:
+                    raise RuntimeError("tutorial still covers Post")
+                if trial is not True or timeout != 2000:
+                    raise AssertionError("unexpected actionability probe")
+                order.append("trial")
+
+        class Base:
+            def get_by_role(self, role: str, *, name: str, exact: bool):
+                if role == "button" and name == "知道了" and exact is True:
+                    return FakeTikTokCollection([TutorialButton()])
+                return FakeTikTokCollection([])
+
+        app = self.uploader(tags=[])
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+        app._final_action_button = AsyncMock(return_value=ActionButton())
+        page = FakeTikTokPage()
+
+        with patch.object(
+            tiktok_uploader.asyncio,
+            "sleep",
+            new=AsyncMock(return_value=None),
+        ):
+            asyncio.run(TiktokVideo._wait_until_ready(app, page, Base()))
+
+        self.assertEqual(order, ["tutorial", "center", "trial"])
+
+    def test_post_ready_neutralizes_disabled_cookie_banner_before_trial(self) -> None:
+        order: list[str] = []
+
+        class CookieButton:
+            async def count(self) -> int:
+                return 1
+
+            async def is_visible(self) -> bool:
+                return True
+
+            async def is_enabled(self) -> bool:
+                return False
+
+            async def click(self, **_kwargs) -> None:
+                raise AssertionError("disabled consent control must not be clicked")
+
+            async def evaluate(self, expression: str) -> bool:
+                if "pointer-events" not in expression or "Cookie" not in expression:
+                    raise AssertionError("only the known cookie banner may be neutralized")
+                order.append("cookie")
+                return True
+
+        class ActionButton:
+            async def evaluate(self, _expression: str) -> None:
+                order.append("center")
+
+            async def click(self, *, trial: bool = False, timeout: int = 0) -> None:
+                if order[:2] != ["cookie", "center"]:
+                    raise RuntimeError("cookie banner still covers Post")
+                if trial is not True or timeout != 2000:
+                    raise AssertionError("unexpected actionability probe")
+                order.append("trial")
+
+        class Base:
+            def get_by_role(self, role: str, *, name: str, exact: bool):
+                if (
+                    role == "button"
+                    and name == "拒绝可选 Cookie"
+                    and exact is True
+                ):
+                    return FakeTikTokCollection([CookieButton()])
+                return FakeTikTokCollection([])
+
+        app = self.uploader(tags=[])
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+        app._final_action_button = AsyncMock(return_value=ActionButton())
+
+        with patch.object(
+            tiktok_uploader.asyncio,
+            "sleep",
+            new=AsyncMock(return_value=None),
+        ):
+            asyncio.run(
+                TiktokVideo._wait_until_ready(
+                    app,
+                    FakeTikTokPage(),
+                    Base(),
+                )
+            )
+
+        self.assertEqual(order, ["cookie", "center", "trial"])
+
+    def test_post_ready_centers_visible_button_before_trial_click(self) -> None:
+        button = AsyncMock()
+        app = self.uploader(tags=[])
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+        app._final_action_button = AsyncMock(return_value=button)
+
+        asyncio.run(
+            TiktokVideo._wait_until_ready(
+                app,
+                FakeTikTokPage(),
+                SimpleNamespace(),
+            )
+        )
+
+        button.evaluate.assert_awaited_once()
+        expression = button.evaluate.await_args.args[0]
+        self.assertIn("scrollIntoView", expression)
+        self.assertIn("center", expression)
+        button.click.assert_awaited_once_with(trial=True, timeout=2000)
+
+    def test_final_action_trial_click_does_not_consume_authorization(self) -> None:
+        raw_button = AsyncMock()
+        trigger = Mock()
+        wrapped = overseas_tiktok_publish._FinalActionButton(raw_button, trigger)
+
+        asyncio.run(wrapped.click(trial=True, timeout=2000))
+
+        trigger.assert_not_called()
+        raw_button.click.assert_awaited_once_with(trial=True, timeout=2000)
+
     def test_submit_once_clicks_once_without_uploading_again(self) -> None:
         app = self.uploader(tags=[], execution_mode="formal")
         app.publish_confirmed = True
@@ -1960,8 +2321,284 @@ class TikTokFormAdapterTests(unittest.TestCase):
         result = asyncio.run(app.submit_once(AsyncMock(), AsyncMock()))
 
         app._upload_file.assert_not_awaited()
-        button.click.assert_awaited_once()
+        button.click.assert_awaited_once_with(no_wait_after=True)
         self.assertEqual(result["status"], "published")
+
+    def test_submit_once_waits_for_music_copyright_check_before_snapshot_and_click(self) -> None:
+        app = self.uploader(tags=[], execution_mode="formal")
+        app.publish_confirmed = True
+        order: list[str] = []
+        button = AsyncMock()
+        button.click.side_effect = lambda **_kwargs: order.append("click")
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+        app._wait_for_music_copyright_check = AsyncMock(
+            side_effect=lambda _page: order.append("copyright")
+        )
+
+        async def snapshot(_page, _base):
+            order.append("snapshot")
+            return {
+                "plainCaption": "Title\n\nBody",
+                "topicEntities": [],
+                "visibility": "public",
+            }
+
+        app._verify_form_snapshot = snapshot
+        app._post_button = AsyncMock(return_value=button)
+        app._wait_for_publish_result = AsyncMock(
+            return_value="platform_feedback:video posted successfully"
+        )
+
+        asyncio.run(app.submit_once(AsyncMock(), AsyncMock()))
+
+        self.assertEqual(order, ["copyright", "snapshot", "click"])
+
+    def test_music_copyright_check_waits_until_no_issues_are_reported(self) -> None:
+        page = FakeTikTokPage()
+        app = self.uploader(tags=[])
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+        stages: list[str] = []
+        app.form_stage_observer = stages.append
+
+        with patch.object(
+            tiktok_uploader,
+            "_body_text",
+            new=AsyncMock(
+                side_effect=[
+                    "音乐版权检查\n正在检查。这需要大概 30 秒。\n内容快速检查",
+                    "音乐版权检查\n未发现问题。\n内容快速检查",
+                ]
+            ),
+        ):
+            result = asyncio.run(
+                TiktokVideo._wait_for_music_copyright_check(app, page)
+            )
+
+        self.assertEqual(result, "passed")
+        self.assertEqual(stages, ["copyright_check_waiting", "copyright_check_verified"])
+
+    def test_submit_once_uses_verified_locator_dispatch_for_controlled_final_action(self) -> None:
+        app = self.uploader(tags=[], execution_mode="formal")
+        app.publish_confirmed = True
+        app.final_action_observer = Mock()
+        button = AsyncMock()
+        page = SimpleNamespace(
+            mouse=SimpleNamespace(click=AsyncMock()),
+        )
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+        app._verify_form_snapshot = AsyncMock(
+            return_value={
+                "plainCaption": "Title\n\nBody",
+                "topicEntities": [],
+                "visibility": "public",
+            }
+        )
+        app._post_button = AsyncMock(return_value=button)
+        app._wait_for_publish_result = AsyncMock(
+            return_value="platform_feedback:video posted successfully"
+        )
+
+        result = asyncio.run(app.submit_once(page, AsyncMock()))
+
+        button.scroll_into_view_if_needed.assert_awaited_once_with(timeout=5000)
+        self.assertEqual(
+            button.click.await_args_list,
+            [
+                call(trial=True, timeout=5000),
+                call(no_wait_after=True, timeout=5000),
+            ],
+        )
+        button.bounding_box.assert_not_awaited()
+        app.final_action_observer.assert_called_once_with()
+        page.mouse.click.assert_not_awaited()
+        self.assertEqual(result["status"], "published")
+
+    def test_pending_checks_dialog_clicks_exact_continue_button_once(self) -> None:
+        app = self.uploader(tags=[], execution_mode="formal")
+        app.publish_confirmed = True
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+        stages: list[str] = []
+        app.form_stage_observer = stages.append
+        body = AsyncMock()
+        body.inner_text.return_value = (
+            "继续发布？\n"
+            "版权检查未完成。我们仍在检查你的视频是否存在潜在问题。\n"
+            "检查尚未完成，仍要发布？\n取消\n立即发布"
+        )
+        confirm = AsyncMock()
+        confirm.count.return_value = 1
+        confirm.is_visible.return_value = True
+        confirm.is_enabled.return_value = True
+
+        class Root:
+            url = "https://www.tiktok.com/tiktokstudio/upload?lang=zh-Hans"
+
+            def locator(self, selector: str):
+                if selector == "body":
+                    return body
+                raise AssertionError(f"unexpected selector: {selector}")
+
+            def get_by_role(self, role: str, *, name: str, exact: bool):
+                self.last_query = (role, name, exact)
+                if name == "立即发布":
+                    return confirm
+                missing = AsyncMock()
+                missing.count.return_value = 0
+                return missing
+
+            async def wait_for_timeout(self, _milliseconds: int) -> None:
+                return None
+
+        root = Root()
+
+        result = asyncio.run(
+            app._confirm_pending_checks_dialog(root, root)
+        )
+
+        self.assertTrue(result)
+        self.assertEqual(
+            confirm.click.await_args_list,
+            [
+                call(trial=True, timeout=5000),
+                call(no_wait_after=True, timeout=5000),
+            ],
+        )
+        self.assertEqual(stages, ["pending_checks_confirmed"])
+
+    def test_submit_once_handles_pending_checks_confirmation_before_result_readback(self) -> None:
+        app = self.uploader(tags=[], execution_mode="formal")
+        app.publish_confirmed = True
+        order: list[str] = []
+        button = AsyncMock()
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+        app._wait_for_music_copyright_check = AsyncMock(return_value="passed")
+        app._verify_form_snapshot = AsyncMock(
+            return_value={
+                "plainCaption": "Title\n\nBody",
+                "topicEntities": [],
+                "visibility": "public",
+            }
+        )
+        app._post_button = AsyncMock(return_value=button)
+        app._click_immediate_post = AsyncMock(
+            side_effect=lambda _page, _button: order.append("post")
+        )
+        app._confirm_pending_checks_dialog = AsyncMock(
+            side_effect=lambda _page, _base: order.append("confirm")
+        )
+        app._wait_for_publish_result = AsyncMock(
+            side_effect=lambda _page: order.append("result")
+            or "platform_feedback:video posted successfully"
+        )
+
+        result = asyncio.run(app.submit_once(AsyncMock(), AsyncMock()))
+
+        self.assertEqual(order, ["post", "confirm", "result"])
+        self.assertEqual(result["status"], "published")
+
+    def test_publish_result_requires_exact_public_row_after_content_route(self) -> None:
+        app = self.uploader(tags=[])
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+        receipt = {
+            "contentId": "1234567890123456789",
+            "contentUrl": (
+                "https://www.tiktok.com/@expected.user/video/"
+                "1234567890123456789"
+            ),
+            "publishedAt": "2026-09-02T23:21:10+08:00",
+            "visibility": "public",
+            "evidence": "tiktok_studio_public_content_exact_match",
+        }
+        app._public_content_list_receipt = AsyncMock(
+            side_effect=[None, receipt]
+        )
+        page = SimpleNamespace(
+            url="https://www.tiktok.com/tiktokstudio/content?lang=zh-Hans"
+        )
+
+        with (
+            patch.object(
+                tiktok_uploader,
+                "_feedback_text",
+                new=AsyncMock(return_value=""),
+            ),
+            patch.object(
+                tiktok_uploader,
+                "_body_text",
+                new=AsyncMock(return_value=""),
+            ),
+            patch.object(
+                tiktok_uploader.asyncio,
+                "sleep",
+                new=AsyncMock(return_value=None),
+            ),
+        ):
+            result = asyncio.run(app._wait_for_publish_result(page))
+
+        self.assertEqual(result, receipt)
+        self.assertEqual(app._public_content_list_receipt.await_count, 2)
+
+    def test_public_content_list_receipt_matches_caption_account_and_visibility(self) -> None:
+        app = self.uploader(tags=["AI", "效率"])
+        anchor = AsyncMock()
+        anchor.is_visible.return_value = True
+        anchor.inner_text.return_value = "Title Body #AI #效率"
+        anchor.get_attribute.return_value = (
+            "https://www.tiktok.com/@expected.user/video/1234567890123456789"
+        )
+        anchor.evaluate.return_value = (
+            "00:48\nTitle Body #AI #效率\n9月2日 23:21\n所有人\n0\n0\n0"
+        )
+        anchors = Mock()
+        anchors.count = AsyncMock(return_value=1)
+        anchors.nth.return_value = anchor
+        page = SimpleNamespace(
+            url="https://www.tiktok.com/tiktokstudio/content?lang=zh-Hans",
+            locator=Mock(return_value=anchors),
+        )
+
+        receipt = asyncio.run(app._public_content_list_receipt(page))
+
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt["contentId"], "1234567890123456789")
+        self.assertEqual(receipt["visibility"], "public")
+        self.assertEqual(
+            receipt["evidence"],
+            "tiktok_studio_public_content_exact_match",
+        )
+
+    def test_submit_once_projects_exact_content_list_receipt(self) -> None:
+        app = self.uploader(tags=[], execution_mode="formal")
+        app.publish_confirmed = True
+        button = AsyncMock()
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+        app._wait_for_music_copyright_check = AsyncMock(return_value="passed")
+        app._verify_form_snapshot = AsyncMock(
+            return_value={
+                "plainCaption": "Title\n\nBody",
+                "topicEntities": [],
+                "visibility": "public",
+            }
+        )
+        app._post_button = AsyncMock(return_value=button)
+        app._confirm_pending_checks_dialog = AsyncMock(return_value=True)
+        receipt = {
+            "contentId": "1234567890123456789",
+            "contentUrl": (
+                "https://www.tiktok.com/@expected.user/video/"
+                "1234567890123456789"
+            ),
+            "publishedAt": "2026-09-02T23:21:10+08:00",
+            "visibility": "public",
+            "evidence": "tiktok_studio_public_content_exact_match",
+        }
+        app._wait_for_publish_result = AsyncMock(return_value=receipt)
+
+        result = asyncio.run(app.submit_once(AsyncMock(), AsyncMock()))
+
+        self.assertEqual(result["status"], "published")
+        self.assertEqual(result["evidence"], receipt["evidence"])
+        self.assertEqual(result["receipt"], receipt)
 
     def test_submit_once_is_consumed_after_click_or_result_failure(self) -> None:
         for failure_stage in ("click", "result"):
@@ -2003,6 +2640,36 @@ class TikTokFormAdapterTests(unittest.TestCase):
 
 
 class OverseasVideoPublishSignalTests(unittest.TestCase):
+    def test_tiktok_content_route_requires_exact_row_when_feedback_dom_is_unreadable(self) -> None:
+        class Page:
+            url = "https://www.tiktok.com/tiktokstudio/content?lang=zh-Hans"
+
+        app = TiktokVideo(
+            "测试",
+            "/not/used.mp4",
+            [],
+            0,
+            "/not/used.json",
+            execution_mode="formal",
+        )
+        app._wait_for_manual_intervention = AsyncMock(return_value=None)
+        receipt = {
+            "contentId": "1234567890123456789",
+            "contentUrl": "https://www.tiktok.com/@expected/video/1234567890123456789",
+            "publishedAt": "2026-09-02T23:21:10+08:00",
+            "visibility": "public",
+            "evidence": "tiktok_studio_public_content_exact_match",
+        }
+        app._public_content_list_receipt = AsyncMock(return_value=receipt)
+        with patch.object(
+            tiktok_uploader,
+            "_feedback_text",
+            new=AsyncMock(side_effect=TimeoutError("feedback DOM unavailable")),
+        ):
+            signal = asyncio.run(app._wait_for_publish_result(Page()))
+
+        self.assertEqual(signal, receipt)
+
     def test_tiktok_success_and_security_signals_are_specific(self) -> None:
         self.assertIsNotNone(
             tiktok_publish_success_signal(

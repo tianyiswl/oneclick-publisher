@@ -4,8 +4,8 @@ from app_core.branding import APP_VERSION
 
 
 class BrandingVersionTests(unittest.TestCase):
-    def test_current_integration_release_is_0_5_30(self) -> None:
-        self.assertEqual(APP_VERSION, "0.5.30")
+    def test_current_integration_release_is_0_5_31(self) -> None:
+        self.assertEqual(APP_VERSION, "0.5.31")
 
 
 if __name__ == "__main__":

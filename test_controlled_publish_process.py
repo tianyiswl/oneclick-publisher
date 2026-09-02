@@ -25,6 +25,7 @@ from app_core import (
 )
 from app_core.controlled_publish import ControlledPublishError
 from app_core.controlled_publish_process import (
+    _formal_payloads_from_preflight,
     submit_authorized_preflight_task,
     submit_douyin_graphic_matrix_request_in_process,
     submit_request_in_process,
@@ -35,6 +36,28 @@ from uploader.meta_uploader.page_form import (
     FacebookPageFormSnapshot,
 )
 from utils import publish_tasks
+
+
+class TikTokFormalPayloadTests(unittest.TestCase):
+    def test_formal_conversion_confirms_frozen_ai_caption_disclosure(self) -> None:
+        stored = {
+            "type": 6,
+            "runtimeMode": "preflight",
+            "debugDryRun": True,
+            "backgroundMode": False,
+            "aiGenerated": True,
+            "aiDeclarationExplicitlyConfirmed": False,
+            "tiktokAiDisclosureMode": "caption",
+            "description": "Body\n\nAI-generated content.",
+        }
+
+        formal = _formal_payloads_from_preflight([stored])[0]
+
+        self.assertEqual(formal["runtimeMode"], "publish")
+        self.assertFalse(formal["debugDryRun"])
+        self.assertTrue(formal["aiDeclarationExplicitlyConfirmed"])
+        self.assertEqual(formal["tiktokAiDisclosureMode"], "caption")
+        self.assertEqual(formal["description"], stored["description"])
 
 
 class FacebookPagePublicEntryFixture:

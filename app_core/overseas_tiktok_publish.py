@@ -50,6 +50,10 @@ from .tiktok_schedule_contract import (
     parse_tiktok_schedule_fields,
     validate_tiktok_schedule_window,
 )
+from .tiktok_ai_disclosure import (
+    TIKTOK_AI_DISCLOSURE_MODE_CAPTION,
+    has_canonical_tiktok_ai_caption_disclosure,
+)
 
 
 TIKTOK_CONTENT_LIMIT = 2200
@@ -505,11 +509,10 @@ def _validate_unsupported_settings(payload: Mapping[str, Any]) -> str:
                 "containsaigeneratedcontent",
                 "aideclarationexplicitlyconfirmed",
             }:
-                if _ai_requested(value):
-                    _fail(
-                        "tiktok_unsupported_publish_setting",
-                        "TikTok 首版不支持 AI 内容声明",
-                    )
+                # The exact root-level caption disclosure contract is checked
+                # after the canonical body has been read. Nested aliases remain
+                # fail-closed and cannot opt into this exception.
+                continue
             elif key in {"coverpath", "coverpaths", "covers", "customcover"}:
                 if _is_nonempty(value):
                     _fail(
@@ -541,6 +544,72 @@ def _validate_unsupported_settings(payload: Mapping[str, Any]) -> str:
             "TikTok 首版只支持公开发布",
         )
     return "public"
+
+
+def _validate_ai_caption_disclosure(
+    payload: Mapping[str, Any],
+    *,
+    body: str,
+    mode: str,
+) -> str:
+    ai_keys = {
+        "aigenerated",
+        "aidisclosure",
+        "containsaigeneratedcontent",
+        "aideclarationexplicitlyconfirmed",
+        "tiktokaidisclosuremode",
+    }
+    for mapping in _walk_tiktok_payload_mappings(payload, at_root=True):
+        if mapping is payload:
+            continue
+        for raw_key, value in mapping.items():
+            if str(raw_key).strip().lower() in ai_keys and _ai_requested(value):
+                _fail(
+                    "tiktok_unsupported_publish_setting",
+                    "TikTok AI 内容声明字段位置无效",
+                )
+
+    root = {str(key).strip().lower(): value for key, value in payload.items()}
+    if _ai_requested(root.get("aidisclosure")) or _ai_requested(
+        root.get("containsaigeneratedcontent")
+    ):
+        _fail(
+            "tiktok_unsupported_publish_setting",
+            "TikTok AI 内容声明必须使用受控快照",
+        )
+
+    ai_generated = root.get("aigenerated")
+    explicit_confirmation = root.get("aideclarationexplicitlyconfirmed")
+    disclosure_mode = str(root.get("tiktokaidisclosuremode") or "").strip()
+    if ai_generated in (None, False, "", 0):
+        if explicit_confirmation not in (None, False, "", 0) or disclosure_mode:
+            _fail(
+                "tiktok_unsupported_publish_setting",
+                "TikTok AI 内容披露与内容声明不一致",
+            )
+        return ""
+    if ai_generated is not True:
+        _fail(
+            "tiktok_unsupported_publish_setting",
+            "TikTok AI 内容声明格式无效",
+        )
+    if disclosure_mode != TIKTOK_AI_DISCLOSURE_MODE_CAPTION:
+        _fail(
+            "tiktok_unsupported_publish_setting",
+            "TikTok AI 内容缺少可验证的正文披露",
+        )
+    expected_confirmation = mode == "formal"
+    if explicit_confirmation is not expected_confirmation:
+        _fail(
+            "tiktok_unsupported_publish_setting",
+            "TikTok AI 内容声明与执行阶段不一致",
+        )
+    if not has_canonical_tiktok_ai_caption_disclosure(body):
+        _fail(
+            "tiktok_unsupported_publish_setting",
+            "TikTok AI 内容正文缺少明确披露",
+        )
+    return TIKTOK_AI_DISCLOSURE_MODE_CAPTION
 
 
 def _strict_integer(value: object) -> int:
@@ -1071,6 +1140,11 @@ def validate_tiktok_payload(
         frozenset({"description", "body"}),
         label="正文",
     )
+    ai_disclosure_mode = _validate_ai_caption_disclosure(
+        payload,
+        body=body,
+        mode=mode,
+    )
     if "@" in title or "@" in body:
         _fail(
             "tiktok_unsupported_publish_setting",
@@ -1107,6 +1181,7 @@ def validate_tiktok_payload(
         "scheduleMode": schedule_intent.mode,
         "scheduledAt": schedule_intent.local_time,
         "scheduleTimezone": schedule_intent.timezone,
+        "aiDisclosureMode": ai_disclosure_mode,
     }
 
 
@@ -1338,7 +1413,8 @@ class _FinalActionButton:
         self._trigger = trigger
 
     async def click(self, *args, **kwargs):
-        self._trigger()
+        if kwargs.get("trial") is not True:
+            self._trigger()
         return await self._button.click(*args, **kwargs)
 
     def __getattr__(self, name: str):
@@ -1349,6 +1425,7 @@ def _instrument_final_action(uploader, *, trigger) -> bool:
     original = getattr(uploader, "_final_action_button", None)
     if not callable(original):
         return False
+    uploader.final_action_observer = trigger
 
     async def tracked(base):
         button = await original(base)
@@ -1546,14 +1623,23 @@ async def _run_tiktok_platform(
             "caption_editor_waiting": "TikTok 正在等待文案编辑区域",
             "caption_editor_ready": "TikTok 文案编辑区域已就绪",
             "caption_write_started": "TikTok 正在写入文案",
+            "caption_editor_recovered": "TikTok 正文编辑器重挂载，已安全重写一次",
             "caption_write_verified": "TikTok 文案写入已回读",
             "topics_started": "TikTok 正在核对官方话题",
+            "topic_candidates_recovered": "TikTok 话题候选组件重挂载，已安全重建一次",
             "topics_verified": "TikTok 官方话题已回读",
             "visibility_started": "TikTok 正在核对公开范围",
             "visibility_verified": "TikTok 公开范围已回读",
             "post_ready_waiting": "TikTok 正在等待最终按钮就绪",
+            "tutorial_dismissed": "TikTok 已关闭阻挡发布按钮的新手引导",
+            "cookie_banner_neutralized": "TikTok 已解除 Cookie 提示条对发布按钮的遮挡",
+            "post_actionability_verified": "TikTok 最终按钮已通过真实可点击检查",
+            "copyright_check_waiting": "TikTok 正在等待音乐版权检查完成",
+            "copyright_check_verified": "TikTok 音乐版权检查已通过",
+            "pending_checks_confirmed": "TikTok 已确认检查未完成提示并继续发布",
             "form_snapshot_started": "TikTok 正在执行最终表单快照核对",
             "form_snapshot_verified": "TikTok 最终表单快照已核对",
+            "final_click_dispatched": "TikTok Post 点击已发出，正在等待平台回执",
         }
 
         def observe_form_stage(stage: str) -> None:

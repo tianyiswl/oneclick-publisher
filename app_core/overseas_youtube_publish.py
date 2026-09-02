@@ -429,6 +429,29 @@ class YouTubeVideoManagementClient:
             status["publishAt"] = publish_at
         else:
             status.pop("publishAt", None)
+
+        def confirmed_after_uncertain_response() -> YouTubeVideoStatus | None:
+            """A timed-out PUT may still have committed; accept only exact GET proof."""
+
+            try:
+                confirmed = self.read_status(token, video_id=exact_video_id)
+            except Exception:
+                return None
+            expected_publish_at = (
+                publish_at if visibility == "scheduled_public" else None
+            )
+            if (
+                confirmed.video_id != exact_video_id
+                or confirmed.privacy_status != privacy_status
+                or confirmed.publish_at != expected_publish_at
+                or (
+                    confirmed.made_for_kids is not None
+                    and confirmed.made_for_kids != made_for_kids
+                )
+            ):
+                return None
+            return confirmed
+
         try:
             response = self._transport.put(
                 YOUTUBE_VIDEOS_ENDPOINT,
@@ -442,14 +465,23 @@ class YouTubeVideoManagementClient:
                 allow_redirects=False,
             )
         except Exception:
+            confirmed = confirmed_after_uncertain_response()
+            if confirmed is not None:
+                return confirmed
             raise YouTubeOfficialPublishError(
                 "youtube_visibility_update_failed"
             ) from None
         if _response_status(response) != 200:
+            confirmed = confirmed_after_uncertain_response()
+            if confirmed is not None:
+                return confirmed
             raise YouTubeOfficialPublishError("youtube_visibility_update_failed")
         try:
             return _parse_exact_video_status(response, video_id=exact_video_id)
         except YouTubeOfficialPublishError:
+            confirmed = confirmed_after_uncertain_response()
+            if confirmed is not None:
+                return confirmed
             raise YouTubeOfficialPublishError(
                 "youtube_visibility_update_failed"
             ) from None
