@@ -172,6 +172,157 @@ class FacebookPageExecutorTests(unittest.TestCase):
             ),
         }
 
+    def _real_session_lifecycle(
+        self,
+        *,
+        mode: str,
+        failure: BaseException | None = None,
+    ) -> tuple[list[tuple[str, dict[str, object]]], int, int]:
+        events: list[tuple[str, dict[str, object]]] = []
+        browser = SimpleNamespace(close_count=0)
+        context = SimpleNamespace(close_count=0)
+        page = SimpleNamespace()
+
+        async def close_browser() -> None:
+            browser.close_count += 1
+
+        async def close_context() -> None:
+            context.close_count += 1
+
+        async def new_page():
+            return page
+
+        async def goto(_url, *, wait_until):
+            self.assertEqual(wait_until, "domcontentloaded")
+
+        browser.close = close_browser
+        context.close = close_context
+        context.new_page = new_page
+        page.goto = goto
+
+        class PlaywrightContext:
+            async def __aenter__(self):
+                return SimpleNamespace()
+
+            async def __aexit__(self, *_args) -> None:
+                return None
+
+        class Verifier:
+            def __init__(self, *_args, **_kwargs) -> None:
+                return None
+
+            async def _wait_for_manual_intervention(self, _page) -> None:
+                return None
+
+        async def launch(_playwright):
+            return browser
+
+        async def new_context(_browser, *, storage_state, timezone_id):
+            self.assertEqual(
+                storage_state,
+                str(self.cookie_dir / "facebook-page.json"),
+            )
+            self.assertEqual(timezone_id, "Asia/Shanghai")
+            return context
+
+        async def init(current) -> None:
+            self.assertIs(current, context)
+
+        async def scenario() -> None:
+            prepared = self._prepared(self.payload(mode))
+            async with overseas_browser_publish._facebook_page_session(
+                prepared,
+                progress=lambda stage, receipt: events.append(
+                    (stage, dict(receipt))
+                ),
+            ):
+                if failure is not None:
+                    raise failure
+
+        with (
+            patch.object(
+                overseas_browser_publish,
+                "async_playwright",
+                return_value=PlaywrightContext(),
+            ),
+            patch.object(
+                overseas_browser_publish,
+                "launch_publish_browser",
+                side_effect=launch,
+            ),
+            patch.object(
+                overseas_browser_publish,
+                "new_publish_context",
+                side_effect=new_context,
+            ),
+            patch.object(
+                overseas_browser_publish,
+                "set_init_script",
+                side_effect=init,
+            ),
+            patch.object(overseas_browser_publish, "MetaReelVideo", Verifier),
+        ):
+            if failure is None:
+                asyncio.run(scenario())
+            else:
+                with self.assertRaises(type(failure)):
+                    asyncio.run(scenario())
+        return events, context.close_count, browser.close_count
+
+    def test_visible_preflight_session_reports_normal_close_reason(self) -> None:
+        events, context_closes, browser_closes = self._real_session_lifecycle(
+            mode="preflight"
+        )
+
+        self.assertEqual(
+            events,
+            [
+                (
+                    "browser_session_opened",
+                    {"pageId": "1001", "purpose": "preflight"},
+                ),
+                (
+                    "browser_session_closed",
+                    {
+                        "pageId": "1001",
+                        "purpose": "preflight",
+                        "closeReason": "preflight_completed",
+                    },
+                ),
+            ],
+        )
+        self.assertEqual((context_closes, browser_closes), (1, 1))
+
+    def test_visible_formal_session_reports_outcome_unknown_close_reason(self) -> None:
+        failure = FacebookPagePublishError(
+            "facebook_publish_outcome_unknown",
+            "offline ambiguous outcome",
+            outcome_ambiguous=True,
+        )
+        events, context_closes, browser_closes = self._real_session_lifecycle(
+            mode="publish",
+            failure=failure,
+        )
+
+        self.assertEqual(
+            events,
+            [
+                (
+                    "browser_session_opened",
+                    {"pageId": "1001", "purpose": "formal"},
+                ),
+                (
+                    "browser_session_closed",
+                    {
+                        "pageId": "1001",
+                        "purpose": "formal",
+                        "closeReason": "outcome_unknown",
+                    },
+                ),
+            ],
+        )
+        self.assertEqual((context_closes, browser_closes), (1, 1))
+
     @contextmanager
     def patched_runtime(
         self,
@@ -195,6 +346,40 @@ class FacebookPageExecutorTests(unittest.TestCase):
 
             async def is_enabled(self) -> bool:
                 return True
+
+            async def is_visible(self) -> bool:
+                return True
+
+        class Locator:
+            def __init__(self, elements) -> None:
+                self.elements = list(elements)
+
+            async def count(self) -> int:
+                return len(self.elements)
+
+            def nth(self, index: int):
+                return self.elements[index]
+
+        class Page:
+            url = (
+                "https://business.facebook.com/latest/reels_composer/"
+                f"?asset_id={owner.page_id}"
+            )
+
+            def __init__(self) -> None:
+                self.handlers: dict[str, list] = {}
+                self.button = Button()
+
+            def on(self, event: str, callback) -> None:
+                self.handlers.setdefault(event, []).append(callback)
+
+            def remove_listener(self, event: str, callback) -> None:
+                self.handlers.get(event, []).remove(callback)
+
+            def get_by_role(self, role: str, *, name=None, exact=None):
+                if role == "button" and name == "Publish" and exact is True:
+                    return Locator([self.button])
+                return Locator([])
 
         class Adapter(PageFormContract):
             def __init__(self, page, *, wait_for_verification) -> None:
@@ -307,7 +492,7 @@ class FacebookPageExecutorTests(unittest.TestCase):
                 return None
 
             try:
-                yield SimpleNamespace(), SimpleNamespace(), verify
+                yield SimpleNamespace(), Page(), verify
             finally:
                 owner.log.append("session:closed")
 
@@ -567,6 +752,7 @@ class FacebookPageExecutorTests(unittest.TestCase):
                 "final_action_claimed",
                 "final_action_clicked",
                 "platform_decision_observed",
+                "post_click_diagnostic",
                 "readback_unique",
             ],
         )
@@ -593,6 +779,295 @@ class FacebookPageExecutorTests(unittest.TestCase):
             formal_events,
             [],
         )
+
+    def test_formal_post_click_diagnostic_spans_click_readback_and_session(self) -> None:
+        """The evidence recorder must cover the one click through list readback."""
+
+        events: list[tuple[str, dict[str, object]]] = []
+
+        class DiagnosticRecorder:
+            def __init__(
+                recorder_self,
+                page,
+                *,
+                expected_page_id: str,
+                final_button_label: str,
+            ) -> None:
+                self.assertEqual(expected_page_id, self.page_id)
+                self.assertEqual(final_button_label, "Publish")
+                recorder_self.page = page
+                self.log.append("diagnostic:init")
+
+            def start(recorder_self) -> None:
+                self.log.append("diagnostic:start")
+
+            def mark_final_action_started(recorder_self) -> None:
+                self.log.append("diagnostic:final-action-started")
+
+            async def sample(
+                recorder_self,
+                phase: str,
+                *,
+                post_click_state: str,
+            ) -> None:
+                self.log.append(
+                    f"diagnostic:sample:{phase}:{post_click_state}"
+                )
+
+            async def drain(recorder_self) -> None:
+                self.log.append("diagnostic:drain")
+
+            def finish(recorder_self) -> dict[str, object]:
+                self.log.append("diagnostic:finish")
+                return {
+                    "schemaVersion": "facebook-post-click-diagnostic/v1",
+                    "pageId": self.page_id,
+                    "samples": [],
+                    "popups": [],
+                    "networkResults": [],
+                    "networkResultCount": 0,
+                    "networkDroppedCount": 0,
+                }
+
+            def stop(recorder_self) -> None:
+                self.log.append("diagnostic:stop")
+
+        with (
+            self.patched_runtime({"formSnapshotHash": "f" * 64}),
+            patch.object(
+                overseas_browser_publish,
+                "FacebookPostClickDiagnosticRecorder",
+                DiagnosticRecorder,
+                create=True,
+            ),
+        ):
+            with patch.object(
+                overseas_browser_publish,
+                "_assert_authorized_form_snapshot",
+                return_value=None,
+                create=True,
+            ):
+                result = overseas_browser_publish.run_facebook_page_publish_sync(
+                    self.payload("publish"),
+                    task_id=512,
+                    progress=lambda stage, receipt: events.append(
+                        (stage, dict(receipt))
+                    ),
+                )
+
+        self.assertTrue(result["ok"])
+        stages = [stage for stage, _receipt in events]
+        self.assertIn("post_click_diagnostic", stages)
+        self.assertLess(
+            self.log.index("diagnostic:start"),
+            self.log.index("diagnostic:final-action-started"),
+        )
+        self.assertLess(
+            self.log.index("diagnostic:final-action-started"),
+            self.log.index("click:start"),
+        )
+        self.assertLess(
+            self.log.index("diagnostic:sample:post_click_observed:unknown"),
+            self.log.index("readback:unique"),
+        )
+        self.assertLess(
+            self.log.index("readback:unique"),
+            self.log.index("diagnostic:sample:readback_finished:unknown"),
+        )
+        self.assertLess(
+            self.log.index("diagnostic:sample:readback_finished:unknown"),
+            self.log.index("diagnostic:drain"),
+        )
+        self.assertLess(
+            self.log.index("diagnostic:drain"),
+            self.log.index("diagnostic:finish"),
+        )
+        self.assertLess(
+            self.log.index("diagnostic:finish"),
+            self.log.index("session:closed"),
+        )
+        self.assertEqual(self.click_count, 1)
+
+    def test_formal_does_not_claim_or_click_when_diagnostic_cannot_arm(self) -> None:
+        events: list[str] = []
+
+        class BrokenDiagnosticRecorder:
+            def __init__(
+                recorder_self,
+                page,
+                *,
+                expected_page_id: str,
+                final_button_label: str,
+            ) -> None:
+                pass
+
+            def start(recorder_self) -> None:
+                raise RuntimeError("offline diagnostic listener failure")
+
+        with (
+            self.patched_runtime({"formSnapshotHash": "f" * 64}),
+            patch.object(
+                overseas_browser_publish,
+                "FacebookPostClickDiagnosticRecorder",
+                BrokenDiagnosticRecorder,
+            ),
+            patch.object(
+                overseas_browser_publish,
+                "_assert_authorized_form_snapshot",
+                return_value=None,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "offline diagnostic listener failure",
+            ),
+        ):
+            overseas_browser_publish.run_facebook_page_publish_sync(
+                self.payload("publish"),
+                task_id=513,
+                progress=lambda stage, receipt: events.append(stage),
+            )
+
+        self.assertEqual(events, [])
+        self.assertEqual(self.click_count, 0)
+
+    def test_diagnostic_finishes_when_post_click_progress_write_fails(self) -> None:
+        stages: list[str] = []
+
+        def progress(stage: str, receipt: object) -> None:
+            stages.append(stage)
+            if stage == "platform_decision_observed":
+                raise RuntimeError("offline progress persistence failure")
+
+        with (
+            self.patched_runtime({"formSnapshotHash": "f" * 64}),
+            patch.object(
+                overseas_browser_publish,
+                "_assert_authorized_form_snapshot",
+                return_value=None,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "offline progress persistence failure",
+            ),
+        ):
+            overseas_browser_publish.run_facebook_page_publish_sync(
+                self.payload("publish"),
+                task_id=514,
+                progress=progress,
+            )
+
+        self.assertEqual(self.click_count, 1)
+        self.assertEqual(
+            stages[-2:],
+            ["platform_decision_observed", "post_click_diagnostic"],
+        )
+        self.assertEqual(self.log[-1], "session:closed")
+
+    def test_diagnostic_keeps_prior_sample_when_final_sample_is_partial(self) -> None:
+        stages: list[str] = []
+
+        class PartialDiagnosticRecorder:
+            def __init__(
+                recorder_self,
+                page,
+                *,
+                expected_page_id: str,
+                final_button_label: str,
+            ) -> None:
+                recorder_self.samples: list[str] = []
+
+            def start(recorder_self) -> None:
+                return None
+
+            async def sample(
+                recorder_self,
+                phase: str,
+                *,
+                post_click_state: str,
+            ) -> None:
+                if phase == "readback_finished":
+                    raise RuntimeError("offline final DOM sample failure")
+                recorder_self.samples.append(phase)
+
+            def finish(recorder_self) -> dict[str, object]:
+                return {
+                    "schemaVersion": "facebook-post-click-diagnostic/v1",
+                    "pageId": self.page_id,
+                    "samples": list(recorder_self.samples),
+                    "popupUrls": [],
+                    "networkResults": [],
+                    "networkResultCount": 0,
+                    "networkDroppedCount": 0,
+                }
+
+            def stop(recorder_self) -> None:
+                return None
+
+        with (
+            self.patched_runtime({"formSnapshotHash": "f" * 64}),
+            patch.object(
+                overseas_browser_publish,
+                "FacebookPostClickDiagnosticRecorder",
+                PartialDiagnosticRecorder,
+            ),
+            patch.object(
+                overseas_browser_publish,
+                "_assert_authorized_form_snapshot",
+                return_value=None,
+            ),
+        ):
+            result = overseas_browser_publish.run_facebook_page_publish_sync(
+                self.payload("publish"),
+                task_id=515,
+                progress=lambda stage, receipt: stages.append(stage),
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertIn("post_click_diagnostic", stages)
+        self.assertEqual(stages[-1], "readback_unique")
+
+    def test_diagnostic_listener_stops_when_click_checkpoint_fails(self) -> None:
+        stopped: list[bool] = []
+
+        class DiagnosticRecorder:
+            def __init__(recorder_self, page, **_kwargs) -> None:
+                return None
+
+            def start(recorder_self) -> None:
+                return None
+
+            def stop(recorder_self) -> None:
+                stopped.append(True)
+
+        def progress(stage: str, receipt: object) -> None:
+            if stage == "final_action_clicked":
+                raise RuntimeError("offline clicked checkpoint failure")
+
+        with (
+            self.patched_runtime({"formSnapshotHash": "f" * 64}),
+            patch.object(
+                overseas_browser_publish,
+                "FacebookPostClickDiagnosticRecorder",
+                DiagnosticRecorder,
+            ),
+            patch.object(
+                overseas_browser_publish,
+                "_assert_authorized_form_snapshot",
+                return_value=None,
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "offline clicked checkpoint failure",
+            ),
+        ):
+            overseas_browser_publish.run_facebook_page_publish_sync(
+                self.payload("publish"),
+                task_id=516,
+                progress=progress,
+            )
+
+        self.assertEqual(self.click_count, 1)
+        self.assertEqual(stopped, [True])
 
     def test_external_absolute_video_reaches_real_form_adapter_with_safe_projections(
         self,
@@ -879,6 +1354,31 @@ class FacebookPageExecutorTests(unittest.TestCase):
             async def is_enabled(self) -> bool:
                 return True
 
+        class EmptyLocator:
+            async def count(self) -> int:
+                return 0
+
+            def nth(self, index: int):  # pragma: no cover - empty by contract
+                raise IndexError(index)
+
+        class BoundaryPage:
+            url = (
+                "https://business.facebook.com/latest/reels_composer/"
+                f"?asset_id={self.page_id}"
+            )
+
+            def __init__(self) -> None:
+                self.handlers: dict[str, list] = {}
+
+            def on(self, event: str, callback) -> None:
+                self.handlers.setdefault(event, []).append(callback)
+
+            def remove_listener(self, event: str, callback) -> None:
+                self.handlers.get(event, []).remove(callback)
+
+            def get_by_role(self, role: str, *, name=None, exact=None):
+                return EmptyLocator()
+
         class BoundaryOnlyAdapter(PageFormContract):
             def __init__(self, page, *, wait_for_verification) -> None:
                 super().__init__(page, wait_for_verification=wait_for_verification)
@@ -978,7 +1478,7 @@ class FacebookPageExecutorTests(unittest.TestCase):
             async def no_verification(_page) -> None:
                 return None
 
-            yield SimpleNamespace(), SimpleNamespace(), no_verification
+            yield SimpleNamespace(), BoundaryPage(), no_verification
 
         publish_service._active_threads.clear()
         self.addCleanup(publish_service._active_threads.clear)
@@ -1201,6 +1701,7 @@ class FacebookPageExecutorTests(unittest.TestCase):
                 "facebook_final_action_claimed",
                 "facebook_final_action_clicked",
                 "facebook_platform_decision_observed",
+                "facebook_post_click_diagnostic_captured",
                 "facebook_readback_unique",
                 "facebook_publish_readback_confirmed",
             ],
@@ -1307,7 +1808,27 @@ class FacebookPageExecutorTests(unittest.TestCase):
         for persisted in persisted_safe_values:
             self.assertNotIn(str(self.video), persisted)
             self.assertNotIn(str(self.video.parent), persisted)
-        self.assertEqual(lifecycle_item_ids, [item_id] * 6)
+        self.assertEqual(lifecycle_item_ids, [item_id] * 7)
+        projected = controlled_publish.project_task(saved)
+        self.assertEqual(
+            projected["postClickDiagnostic"]["schemaVersion"],
+            "facebook-post-click-diagnostic/v2",
+        )
+        self.assertEqual(
+            [
+                sample["phase"]
+                for sample in projected["postClickDiagnostic"]["samples"]
+            ],
+            ["post_click_observed", "readback_finished"],
+        )
+        self.assertEqual(
+            projected["postClickDiagnostic"]["graphqlResults"],
+            [],
+        )
+        self.assertEqual(
+            projected["postClickDiagnostic"]["graphqlResultCount"],
+            0,
+        )
         self.assertIsNone(terminal["workerPid"])
         self.assertEqual(terminal["workerHeartbeatAt"], terminal["finishedAt"])
 
@@ -1404,6 +1925,79 @@ class FacebookPageExecutorTests(unittest.TestCase):
             )
         self.assertEqual(claim["state"], "ambiguous")
         self.assertEqual(int(claim["blocksReplay"]), 1)
+
+    def test_missing_platform_decision_preserves_post_click_state(self) -> None:
+        """A missing optional decision must not erase the observed dialog state."""
+
+        task, payload = self._claimed_formal_task()
+        self.decision_error = FacebookPagePublishError(
+            "facebook_page_baseline_read_failed",
+            "offline composer transition hid the optional decision",
+            receipt={"pageId": self.page_id},
+            outcome_ambiguous=True,
+        )
+        self.post_click_state = "confirmation_pending"
+        self.match_status = "none"
+
+        with self.patched_runtime(real_clicked_at=True, real_contracts=True):
+            publish_service._run_facebook_page_publish(task, [payload])
+
+        saved = task_service.get_task(int(task["id"]))
+        item = saved["items"][0]
+        receipt = json.loads(str(item["receiptJson"]))
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(
+            item["errorCode"],
+            "facebook_post_click_confirmation_pending",
+        )
+        self.assertEqual(receipt["postClickState"], "confirmation_pending")
+        self.assertTrue(receipt["finalActionTriggered"])
+        with database.connect() as conn:
+            claim = dict(
+                conn.execute(
+                    "SELECT * FROM facebook_page_publish_claims WHERE taskId = ?",
+                    (int(task["id"]),),
+                ).fetchone()
+            )
+        self.assertEqual(claim["state"], "ambiguous")
+        self.assertEqual(int(claim["blocksReplay"]), 1)
+        self.assertEqual(str(claim["platformDecisionJson"] or "{}"), "{}")
+
+    def test_unique_readback_succeeds_without_optional_platform_decision(
+        self,
+    ) -> None:
+        """A unique Reel receipt is authoritative even if the toast is gone."""
+
+        task, payload = self._claimed_formal_task()
+        self.decision_error = FacebookPagePublishError(
+            "facebook_page_baseline_read_failed",
+            "offline composer transition hid the optional decision",
+            receipt={"pageId": self.page_id},
+            outcome_ambiguous=True,
+        )
+
+        with self.patched_runtime(real_clicked_at=True, real_contracts=True):
+            publish_service._run_facebook_page_publish(task, [payload])
+
+        saved = task_service.get_task(int(task["id"]))
+        item = saved["items"][0]
+        self.assertEqual(saved["status"], "success")
+        self.assertEqual(item["status"], "success")
+        self.assertEqual(item["platformPostId"], "new-reel-1")
+        self.assertEqual(
+            item["postUrl"],
+            "https://www.facebook.com/reel/new-reel-1",
+        )
+        self.assertEqual(self.click_count, 1)
+        with database.connect() as conn:
+            claim = dict(
+                conn.execute(
+                    "SELECT * FROM facebook_page_publish_claims WHERE taskId = ?",
+                    (int(task["id"]),),
+                ).fetchone()
+            )
+        self.assertEqual(claim["state"], "succeeded")
+        self.assertEqual(str(claim["platformDecisionJson"] or "{}"), "{}")
 
     def test_publish_context_rejects_invalid_and_nested_task_switches(self) -> None:
         for invalid in (0, -1, True, "501"):
@@ -1940,7 +2534,7 @@ class FacebookPageExecutorTests(unittest.TestCase):
         self.assertTrue(raised.exception.receipt["finalActionTriggered"])
         self.assertEqual(self.click_count, 1)
         self.assertNotIn("readback:unique", self.log)
-        self.assertEqual(stages[-1], "final_action_clicked")
+        self.assertEqual(stages[-2:], ["final_action_clicked", "post_click_diagnostic"])
         self.assertEqual(self.log[-1], "session:closed")
 
     def test_post_click_readback_exception_is_ambiguous_with_click_evidence(self) -> None:
@@ -1971,7 +2565,10 @@ class FacebookPageExecutorTests(unittest.TestCase):
         self.assertEqual(raised.exception.receipt["phase"], "ambiguous")
         self.assertTrue(raised.exception.receipt["finalActionTriggered"])
         self.assertEqual(self.click_count, 1)
-        self.assertEqual(stages[-1], "platform_decision_observed")
+        self.assertEqual(
+            stages[-2:],
+            ["platform_decision_observed", "post_click_diagnostic"],
+        )
         self.assertEqual(self.log[-1], "session:closed")
 
     def test_none_and_mismatch_readbacks_are_ambiguous(self) -> None:
@@ -2171,6 +2768,36 @@ class FacebookPagePublishServiceTests(unittest.TestCase):
                 "finalButtonLabel": "Publish",
                 "finalButtonReady": True,
             },
+        }
+
+    @staticmethod
+    def post_click_diagnostic() -> dict[str, object]:
+        return {
+            "schemaVersion": "facebook-post-click-diagnostic/v1",
+            "pageId": "1001",
+            "samples": [
+                {
+                    "phase": "readback_finished",
+                    "capturedAt": "2026-08-30T02:00:01+00:00",
+                    "captureStatus": "ok",
+                    "pageUrl": (
+                        "https://business.facebook.com/latest/reels_composer/"
+                        "?asset_id=1001"
+                    ),
+                    "postClickState": "composer_unchanged",
+                    "dialogs": [],
+                    "notices": [],
+                    "finalButton": {
+                        "label": "Publish",
+                        "visibleCount": 1,
+                        "enabled": False,
+                    },
+                }
+            ],
+            "popupUrls": [],
+            "networkResults": [],
+            "networkResultCount": 0,
+            "networkDroppedCount": 0,
         }
 
     def test_one_worker_start_per_reserved_claim(self) -> None:
@@ -2467,6 +3094,7 @@ class FacebookPagePublishServiceTests(unittest.TestCase):
             progress("final_action_clicked", {"pageId": "1001"})
             clicked_at = self.claim(task_id)["clickedAt"]
             observed.append("clicked:" + str(bool(clicked_at)))
+            progress("post_click_diagnostic", self.post_click_diagnostic())
             match = FacebookReelMatch(
                 status="unique",
                 receipt=FacebookReelReceipt(
@@ -2519,6 +3147,21 @@ class FacebookPagePublishServiceTests(unittest.TestCase):
         )
         self.assertEqual(self.claim(task["id"])["state"], "succeeded")
         self.assertEqual(task_service.get_task(task["id"])["status"], "success")
+        projected = controlled_publish.project_task(
+            task_service.get_task(task["id"])
+        )
+        self.assertEqual(
+            projected["postClickDiagnostic"],
+            self.post_click_diagnostic(),
+        )
+        diagnostic_events = [
+            event
+            for event in task_service.get_task(task["id"])["events"]
+            if event["eventType"]
+            == "facebook_post_click_diagnostic_captured"
+        ]
+        self.assertEqual(len(diagnostic_events), 1)
+        self.assertEqual(int(self.claim(task["id"])["blocksReplay"]), 1)
 
     def test_preflight_worker_persists_verification_wait_and_resumes(self) -> None:
         formal, _payload = self.claimed_task()

@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 from app_core import overseas_meta_content
 from app_core.overseas_meta_errors import FacebookPagePublishError
 from app_core.overseas_meta_page_identity import FacebookPageIdentity
+from uploader.meta_uploader import content_list as meta_content_list
 from uploader.meta_uploader.main import MetaManualInterventionRequired
 from uploader.meta_uploader.page_form import (
     FacebookPageFormAdapter,
@@ -3109,6 +3110,34 @@ class FacebookPageContentListTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(context.actions, ["next_page"])
 
+    async def test_content_list_reuses_one_page_independent_from_composer(self) -> None:
+        """Baseline and readback stay off the clicked composer page."""
+
+        context = _ContentContext(
+            pages=[[]],
+            explicit_empty=True,
+        )
+        composer_page = _ContentPage(context)
+        composer_page.mode = "composer"
+        reader = FacebookPageContentReader(
+            context,
+            wait_for_verification=self.no_verification,
+        )
+
+        baseline = await reader.capture_baseline(expected_page_id="1001")
+        match = await reader.readback_unique_reel(
+            baseline=baseline,
+            expected_page_id="1001",
+            expected_caption_sha256=self.expected_caption_hash,
+            clicked_at=self.clicked_at,
+        )
+
+        self.assertEqual(match.status, "none")
+        self.assertEqual(len(context.created_pages), 1)
+        self.assertIsNot(context.created_pages[0], composer_page)
+        self.assertIs(reader._list_page, context.created_pages[0])
+        self.assertIs(context.created_pages[0].context, context)
+
     async def test_verification_returning_on_another_page_fails_before_list_read(self) -> None:
         wait_count = 0
 
@@ -3150,8 +3179,67 @@ class FacebookPageContentListTests(unittest.IsolatedAsyncioTestCase):
             clicked_at=self.clicked_at,
         )
         self.assertEqual(match, FacebookReelMatch("none", None, 0, 0))
-        self.assertEqual(context.wait_timeout_calls, 3)
+        self.assertEqual(context.wait_timeout_calls, 24)
         self.assertEqual(len(context.created_pages), 1)
+
+    async def test_slow_network_readback_waits_past_four_empty_samples(self) -> None:
+        """Meta 一分钟以上才显示新 Reel 时，不能沿用旧的四次短等待提前收口。"""
+
+        context = _ContentContext(pages=[[]], explicit_empty=True)
+        reader = FacebookPageContentReader(
+            context,
+            wait_for_verification=self.no_verification,
+        )
+        sample_count = 0
+
+        async def delayed_complete_list(_expected_page_id: str):
+            nonlocal sample_count
+            sample_count += 1
+            if sample_count <= 4:
+                return ()
+            return (
+                FacebookReelRow(
+                    page_id="1001",
+                    reel_id="slow-network-reel",
+                    url="https://www.facebook.com/reel/slow-network-reel",
+                    caption_sha256="",
+                    published_at="2026-08-30T02:02:00+00:00",
+                ),
+            )
+
+        async def complete_caption_hash(*_args, **_kwargs):
+            return self.expected_caption_hash
+
+        async def no_real_pause() -> None:
+            context.wait_timeout_calls += 1
+
+        reader._read_complete_list = delayed_complete_list  # type: ignore[method-assign]
+        reader._read_full_caption_hash = complete_caption_hash  # type: ignore[method-assign]
+        reader._bounded_pause = no_real_pause  # type: ignore[method-assign]
+
+        match = await reader.readback_unique_reel(
+            baseline=self.baseline([]),
+            expected_page_id="1001",
+            expected_caption_sha256=self.expected_caption_hash,
+            clicked_at=self.clicked_at,
+        )
+
+        self.assertEqual(match.status, "unique")
+        self.assertEqual(match.receipt.reel_id, "slow-network-reel")
+        self.assertEqual(sample_count, 5)
+        self.assertEqual(context.wait_timeout_calls, 4)
+
+    def test_live_meta_wait_budgets_cover_two_minute_network_delay(self) -> None:
+        self.assertGreaterEqual(
+            meta_content_list._CONTENT_SURFACE_WAIT_ATTEMPTS
+            * meta_content_list._CONTENT_SURFACE_WAIT_MS,
+            120_000,
+        )
+        self.assertGreaterEqual(
+            (meta_content_list._DEFAULT_SETTLEMENT_ATTEMPTS - 1)
+            * meta_content_list._READBACK_SETTLEMENT_WAIT_MS,
+            120_000,
+        )
 
     async def test_post_click_readback_retries_one_transient_list_failure(self) -> None:
         """A one-off list error must not tear down the post-click browser session."""

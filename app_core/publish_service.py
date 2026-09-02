@@ -172,6 +172,26 @@ def _record_douyin_batch_progress(task_id: int, event: object) -> None:
         )
 
 
+def _record_facebook_browser_lifecycle(
+    task_id: int,
+    stage: str,
+    receipt: Mapping[str, object],
+) -> bool:
+    if stage not in {"browser_session_opened", "browser_session_closed"}:
+        return False
+    task_service.record_facebook_browser_session_event(
+        int(task_id),
+        stage="opened" if stage == "browser_session_opened" else "closed",
+        purpose=str(receipt.get("purpose") or ""),
+        close_reason=(
+            str(receipt.get("closeReason") or "")
+            if stage == "browser_session_closed"
+            else ""
+        ),
+    )
+    return True
+
+
 def _runtime_media_path(value: object) -> str:
     """把素材库中的安全文件名解析为运行时绝对路径。"""
 
@@ -799,6 +819,10 @@ def _run_preflight(task: dict, payloads: list[dict[str, Any]]) -> None:
                         stage: str,
                         receipt: Mapping[str, object],
                     ) -> None:
+                        if _record_facebook_browser_lifecycle(
+                            int(task["id"]), stage, receipt
+                        ):
+                            return
                         if stage == "waiting_user_verification":
                             task_service.record_facebook_verification_state(
                                 int(task["id"]),
@@ -1458,7 +1482,15 @@ def _run_facebook_page_publish(
     def progress(stage: str, receipt: Any) -> None:
         nonlocal claim_state, platform_decision
         evidence = dict(receipt) if isinstance(receipt, Mapping) else {}
-        if stage == "waiting_user_verification":
+        if _record_facebook_browser_lifecycle(task_id, stage, evidence):
+            return
+        if stage == "post_click_diagnostic":
+            task_service.record_facebook_post_click_diagnostic(
+                task_id,
+                evidence,
+                worker_token=worker_token,
+            )
+        elif stage == "waiting_user_verification":
             task_service.record_facebook_verification_state(
                 task_id,
                 waiting=True,

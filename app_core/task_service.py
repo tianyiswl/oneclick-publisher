@@ -4094,6 +4094,181 @@ def record_task_event(task_id: int, event_type: str, message: str, *, level: str
         conn.commit()
 
 
+_FACEBOOK_BROWSER_PURPOSE_LABELS = {
+    "preflight": "预检",
+    "formal": "正式发布",
+    "reconciliation": "只读核对",
+}
+_FACEBOOK_BROWSER_CLOSE_MESSAGES = {
+    "preflight_completed": "Facebook Page 预检完成，浏览器已正常关闭",
+    "formal_completed": "Facebook Page 正式发布已取得明确终态，浏览器已正常关闭",
+    "reconciliation_completed": "Facebook Page 只读核对完成，浏览器已正常关闭",
+    "outcome_unknown": "Facebook Page 发布结果仍不明确，浏览器已安全关闭；不会自动重开",
+    "safe_failure": "Facebook Page 在最终动作前停止，浏览器已安全关闭",
+    "reconciliation_failed": "Facebook Page 只读核对失败，浏览器已安全关闭；不会自动重开",
+    "interrupted": "Facebook Page 任务已中断，浏览器已安全关闭",
+}
+
+
+def record_facebook_browser_session_event(
+    task_id: int,
+    *,
+    stage: str,
+    purpose: str,
+    close_reason: str = "",
+) -> None:
+    """Persist one credential-free visible-browser lifecycle edge."""
+
+    normalized_stage = str(stage or "").strip()
+    normalized_purpose = str(purpose or "").strip()
+    normalized_reason = str(close_reason or "").strip()
+    if normalized_stage not in {"opened", "closed"}:
+        raise ValueError("Facebook Page 浏览器事件阶段无效")
+    if normalized_purpose not in _FACEBOOK_BROWSER_PURPOSE_LABELS:
+        raise ValueError("Facebook Page 浏览器用途无效")
+    if normalized_stage == "opened":
+        if normalized_reason:
+            raise ValueError("Facebook Page 浏览器打开事件不能携带关闭原因")
+        message = (
+            f"Facebook Page {_FACEBOOK_BROWSER_PURPOSE_LABELS[normalized_purpose]}"
+            "浏览器已打开"
+        )
+    else:
+        if normalized_reason not in _FACEBOOK_BROWSER_CLOSE_MESSAGES:
+            raise ValueError("Facebook Page 浏览器关闭原因无效")
+        message = _FACEBOOK_BROWSER_CLOSE_MESSAGES[normalized_reason]
+    detail = {
+        "purpose": normalized_purpose,
+        "state": normalized_stage,
+    }
+    if normalized_reason:
+        detail["closeReason"] = normalized_reason
+    detail_json = json.dumps(
+        detail,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    event_type = f"facebook_{normalized_purpose}_browser_{normalized_stage}"
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO publish_task_events
+                (taskId, level, eventType, message, detailJson, createdAt)
+            VALUES (?, 'info', ?, ?, ?, ?)
+            """,
+            (int(task_id), event_type, message, detail_json, _now()),
+        )
+        conn.commit()
+
+
+def record_facebook_post_click_diagnostic(
+    task_id: int,
+    diagnostic: Mapping[str, object],
+    *,
+    worker_token: str = "",
+) -> None:
+    """Append one immutable, credential-free snapshot without changing the claim."""
+
+    from uploader.meta_uploader.post_click_diagnostics import (
+        project_facebook_post_click_diagnostic,
+    )
+
+    with connect() as conn:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT claim.pageReference, claim.state, claim.clickedAt,
+                       task.mode, task.workerToken, item.id AS itemId
+                FROM facebook_page_publish_claims AS claim
+                JOIN publish_tasks AS task ON task.id = claim.taskId
+                JOIN publish_task_items AS item
+                  ON item.taskId = claim.taskId AND item.platformType = 9
+                WHERE claim.taskId = ?
+                """,
+                (int(task_id),),
+            ).fetchone()
+            if (
+                row is None
+                or str(row["mode"] or "") != "oneclick_publish"
+                or str(row["state"] or "")
+                not in {
+                    "final_action_clicked",
+                    "ambiguous",
+                    "succeeded",
+                    "confirmed_not_published",
+                }
+                or not str(row["clickedAt"] or "")
+            ):
+                raise ValueError("Facebook Page 点击后诊断缺少已点击 claim")
+            stored_worker_token = str(row["workerToken"] or "")
+            if stored_worker_token and stored_worker_token != str(worker_token or ""):
+                raise ValueError("Facebook Page 点击后诊断 worker 租约不匹配")
+            safe_diagnostic = project_facebook_post_click_diagnostic(
+                diagnostic,
+                expected_page_id=str(row["pageReference"] or ""),
+            )
+            detail_json = json.dumps(
+                safe_diagnostic,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            existing = conn.execute(
+                """
+                SELECT detailJson FROM publish_task_events
+                WHERE taskId = ?
+                  AND eventType = 'facebook_post_click_diagnostic_captured'
+                ORDER BY id
+                """,
+                (int(task_id),),
+            ).fetchall()
+            if len(existing) > 1:
+                raise ValueError("Facebook Page 点击后诊断事件不唯一")
+            if existing:
+                stored = project_facebook_post_click_diagnostic(
+                    json.loads(str(existing[0]["detailJson"] or "")),
+                    expected_page_id=str(row["pageReference"] or ""),
+                )
+                if stored != safe_diagnostic:
+                    raise ValueError("Facebook Page 点击后诊断不可改写")
+                conn.rollback()
+                return
+            conn.execute(
+                """
+                INSERT INTO publish_task_events
+                    (taskId, itemId, level, eventType, message, detailJson, createdAt)
+                VALUES (?, ?, 'info', 'facebook_post_click_diagnostic_captured',
+                        'Facebook Page 点击后安全诊断已记录', ?, ?)
+                """,
+                (int(task_id), int(row["itemId"]), detail_json, _now()),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def facebook_reconciliation_session_already_opened(task_id: int) -> bool:
+    """Return whether this task already consumed its one read-only session."""
+
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT 1 FROM publish_task_events
+            WHERE taskId = ?
+              AND eventType IN (
+                  'facebook_reconciliation_browser_opened',
+                  'facebook_reconciliation_outcome_unknown'
+              )
+            LIMIT 1
+            """,
+            (int(task_id),),
+        ).fetchone()
+    return row is not None
+
+
 def record_platform_progress(
     task_id: int,
     platform_type: int,

@@ -38,6 +38,9 @@ from uploader.meta_uploader.page_form import (
     FacebookPageFormExpectation,
     FacebookPageFormSnapshot,
 )
+from uploader.meta_uploader.post_click_diagnostics import (
+    FacebookPostClickDiagnosticRecorder,
+)
 
 from . import account_service, database
 from .meta_browser_policy import (
@@ -75,6 +78,59 @@ _LEGACY_META_CONFIRMATION_KEYS = frozenset(
         "overseasVideoPublishConfirmed",
     }
 )
+
+
+def _facebook_browser_purpose(prepared: Mapping[str, Any]) -> str:
+    payload = prepared.get("payload")
+    runtime_mode = (
+        str(payload.get("runtimeMode") or "").strip().lower()
+        if isinstance(payload, Mapping)
+        else ""
+    )
+    return "formal" if runtime_mode == "publish" else "preflight"
+
+
+def _facebook_browser_close_reason(
+    purpose: str,
+    failure: BaseException | None,
+) -> str:
+    if failure is None:
+        return "formal_completed" if purpose == "formal" else "preflight_completed"
+    if isinstance(failure, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+        return "interrupted"
+    if purpose != "formal":
+        return "safe_failure"
+    if isinstance(failure, FacebookPagePublishError):
+        receipt = failure.receipt if isinstance(failure.receipt, Mapping) else {}
+        if (
+            failure.outcome_ambiguous
+            or receipt.get("finalActionTriggered") is True
+        ):
+            return "outcome_unknown"
+        return "safe_failure"
+    # An arbitrary exception while the formal session is alive cannot prove
+    # whether the final click reached Meta. Keep the close reason conservative.
+    return "outcome_unknown"
+
+
+def _report_facebook_progress(
+    progress: Callable[[str, Mapping[str, object]], None] | None,
+    stage: str,
+    receipt: Mapping[str, object],
+    *,
+    required: bool,
+) -> None:
+    if progress is None:
+        return
+    if required:
+        progress(stage, receipt)
+        return
+    try:
+        progress(stage, receipt)
+    except Exception:
+        # Closing the browser is more important than best-effort telemetry;
+        # never turn a verified platform outcome into a failure here.
+        pass
 
 def _canonical_json(value: object) -> str:
     return json.dumps(
@@ -293,6 +349,10 @@ async def _facebook_page_session(
 
     browser = None
     context = None
+    opened = False
+    failure: BaseException | None = None
+    purpose = _facebook_browser_purpose(prepared)
+    page_id = str(prepared.get("pageId") or "")
     async with async_playwright() as playwright:
         try:
             browser = await launch_publish_browser(playwright)
@@ -320,7 +380,17 @@ async def _facebook_page_session(
             )
             await page.goto(FACEBOOK_PAGE_HOME_URL, wait_until="domcontentloaded")
             await verifier_owner._wait_for_manual_intervention(page)
+            opened = True
+            _report_facebook_progress(
+                progress,
+                "browser_session_opened",
+                {"pageId": page_id, "purpose": purpose},
+                required=True,
+            )
             yield context, page, verifier_owner._wait_for_manual_intervention
+        except BaseException as exc:
+            failure = exc
+            raise
         finally:
             if context is not None:
                 try:
@@ -332,6 +402,20 @@ async def _facebook_page_session(
                     await browser.close()
                 except Exception:
                     pass
+            if opened:
+                _report_facebook_progress(
+                    progress,
+                    "browser_session_closed",
+                    {
+                        "pageId": page_id,
+                        "purpose": purpose,
+                        "closeReason": _facebook_browser_close_reason(
+                            purpose,
+                            failure,
+                        ),
+                    },
+                    required=False,
+                )
 
 
 def _form_snapshot_projection(
@@ -699,18 +783,79 @@ async def _facebook_page_formal_async(
             final_snapshot,
             baseline,
         )
-        progress("final_action_claimed", claim_receipt)
-        await button.click()
-        progress(
-            "final_action_clicked",
-            {
-                **_outcome_receipt(prepared, snapshot, baseline),
-                "phase": "final_action_clicked",
-            },
+        diagnostic = FacebookPostClickDiagnosticRecorder(
+            page,
+            expected_page_id=str(prepared["pageId"]),
+            final_button_label=str(final_snapshot.final_action_label),
         )
+        diagnostic.start()
+        try:
+            progress("final_action_claimed", claim_receipt)
+        except BaseException:
+            diagnostic.stop()
+            raise
+        try:
+            mark_final_action_started = getattr(
+                diagnostic,
+                "mark_final_action_started",
+                None,
+            )
+            if callable(mark_final_action_started):
+                mark_final_action_started()
+            await button.click()
+        except BaseException:
+            diagnostic.stop()
+            raise
+        try:
+            progress(
+                "final_action_clicked",
+                {
+                    **_outcome_receipt(prepared, snapshot, baseline),
+                    "phase": "final_action_clicked",
+                },
+            )
+        except BaseException:
+            diagnostic.stop()
+            raise
+        diagnostic_finished = False
+        post_click_state = "unknown"
+
+        async def finish_diagnostic() -> None:
+            nonlocal diagnostic_finished
+            if diagnostic_finished:
+                return
+            diagnostic_finished = True
+            try:
+                try:
+                    await diagnostic.sample(
+                        "readback_finished",
+                        post_click_state=post_click_state,
+                    )
+                except Exception:
+                    pass
+                try:
+                    drain = getattr(diagnostic, "drain", None)
+                    if callable(drain):
+                        await drain()
+                except Exception:
+                    pass
+                try:
+                    evidence = diagnostic.finish()
+                    _report_facebook_progress(
+                        progress,
+                        "post_click_diagnostic",
+                        evidence,
+                        required=False,
+                    )
+                except Exception:
+                    pass
+            finally:
+                diagnostic.stop()
+
         try:
             clicked_at = _load_clicked_at(int(task_id))
         except Exception as exc:
+            await finish_diagnostic()
             raise FacebookPagePublishError(
                 "facebook_publish_outcome_unknown",
                 "Facebook Page 点击后未能读取持久化时间，结果保持未知。",
@@ -718,7 +863,6 @@ async def _facebook_page_formal_async(
                 outcome_ambiguous=True,
             ) from exc
 
-        post_click_state = "unknown"
         observe_post_click = getattr(adapter, "observe_post_click_state", None)
         if callable(observe_post_click):
             try:
@@ -735,6 +879,13 @@ async def _facebook_page_formal_async(
                     post_click_state = observed
             except Exception:
                 post_click_state = "unknown"
+        try:
+            await diagnostic.sample(
+                "post_click_observed",
+                post_click_state=post_click_state,
+            )
+        except Exception:
+            pass
 
         decision: object | None = None
         try:
@@ -747,6 +898,7 @@ async def _facebook_page_formal_async(
                 "facebook_verification_required",
                 "facebook_verification_timeout",
             }:
+                await finish_diagnostic()
                 raise FacebookPagePublishError(
                     "facebook_publish_outcome_unknown",
                     "Facebook Page 最终点击后安全验证未完成，发布结果保持未知。",
@@ -768,13 +920,17 @@ async def _facebook_page_formal_async(
             # continue with the independent, read-only content-list contract.
             pass
         else:
-            progress(
-                "platform_decision_observed",
-                {
-                    "platformDecision": decision,
-                    "postClickState": post_click_state,
-                },
-            )
+            try:
+                progress(
+                    "platform_decision_observed",
+                    {
+                        "platformDecision": decision,
+                        "postClickState": post_click_state,
+                    },
+                )
+            except BaseException:
+                await finish_diagnostic()
+                raise
 
         try:
             match = await reader.readback_unique_reel(
@@ -786,6 +942,7 @@ async def _facebook_page_formal_async(
                 clicked_at=clicked_at,
             )
         except Exception as exc:
+            await finish_diagnostic()
             raise FacebookPagePublishError(
                 "facebook_publish_outcome_unknown",
                 "Facebook Page 点击后内容列表读取失败，结果保持未知。",
@@ -798,13 +955,16 @@ async def _facebook_page_formal_async(
                 outcome_ambiguous=True,
             ) from exc
         if match.status == "unique" and match.receipt is not None:
+            await finish_diagnostic()
+            readback_evidence: dict[str, object] = {
+                "reelMatch": match,
+                "postClickState": post_click_state,
+            }
+            if decision is not None:
+                readback_evidence["platformDecision"] = decision
             progress(
                 "readback_unique",
-                {
-                    "reelMatch": match,
-                    "platformDecision": decision,
-                    "postClickState": post_click_state,
-                },
+                readback_evidence,
             )
             receipt = project_facebook_page_receipt(
                 {
@@ -823,12 +983,13 @@ async def _facebook_page_formal_async(
             }
 
         stage = "readback_mismatch" if match.status == "mismatch" else "readback_none"
+        await finish_diagnostic()
+        readback_evidence = {"postClickState": post_click_state}
+        if decision is not None:
+            readback_evidence["platformDecision"] = decision
         progress(
             stage,
-            {
-                "platformDecision": decision,
-                "postClickState": post_click_state,
-            },
+            readback_evidence,
         )
         if match.status == "mismatch":
             error_code = "facebook_publish_readback_mismatch"

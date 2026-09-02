@@ -2,7 +2,7 @@
   "schema_version": 1,
   "diagram_type": "lifecycle",
   "meta": {
-    "title": "Facebook Page 受控发布生命周期",
+    "title": "Facebook Page 受控发布、应用层诊断与浏览器会话生命周期",
     "output": "docs/architecture/facebook-page-publish.lifecycle.html",
     "quality_profile": "showcase",
     "viewBox": [1900, 760],
@@ -22,8 +22,14 @@
       {
         "id": "readback-reconciliation",
         "label": "平台回读与结果不明",
-        "focus": ["final-action-clicked", "platform-accepted", "verification-after-final", "platform-rejected", "outcome-unknown", "readback-verified", "confirmed-not-published"],
-        "note": "最终动作后只允许回读，不自动重发；结果不明必须先做同一 Page 的只读核对。"
+        "focus": ["final-action-clicked", "mutation-classified", "verification-after-final", "platform-rejected", "outcome-unknown", "readback-verified", "confirmed-not-published"],
+        "note": "最终动作后先封口并排空 mutation 分类，再做独立列表回读；任何应用层分类都不替代唯一 Reel 回执。"
+      },
+      {
+        "id": "browser-session-lifecycle",
+        "label": "可见浏览器会话",
+        "focus": ["page-bound", "form-verified", "safe-failed", "outcome-unknown", "readback-verified"],
+        "note": "后台就绪后记录打开事件，关闭时记录原因；同一结果不明任务不会循环重开后台。"
       }
     ]
   },
@@ -37,7 +43,7 @@
       "id": "page-bound",
       "type": "start",
       "label": "Page 已绑定",
-      "sublabel": "唯一 Page ID 与会话一致",
+      "sublabel": "Page ID 一致；已记打开",
       "lane": "main",
       "col": 0,
       "step": "01",
@@ -47,7 +53,7 @@
       "id": "form-verified",
       "type": "decision",
       "label": "预检表单已回读",
-      "sublabel": "同一页面合同，最终按钮未点击",
+      "sublabel": "未点击；正常关闭已记",
       "lane": "main",
       "col": 1,
       "step": "02",
@@ -57,7 +63,7 @@
       "id": "formal-claim",
       "type": "decision",
       "label": "Formal Claim 就绪",
-      "sublabel": "原子占位 + 点击前内容基线",
+      "sublabel": "原子占位 + v2 监听",
       "lane": "main",
       "col": 2,
       "step": "03",
@@ -67,21 +73,21 @@
       "id": "final-action-clicked",
       "type": "external",
       "label": "最终点击已返回",
-      "sublabel": "最多一次，只能进入结果核对",
+      "sublabel": "已标记边界；禁止重放",
       "lane": "main",
       "col": 3,
       "step": "04",
       "tag": "不可重放"
     },
     {
-      "id": "platform-accepted",
-      "type": "active",
-      "label": "平台已接受",
-      "sublabel": "仍需同一 Page 的唯一作品回读",
+      "id": "mutation-classified",
+      "type": "decision",
+      "label": "Mutation 应用层分类",
+      "sublabel": "data/errors 分类；非回执",
       "lane": "main",
       "col": 4,
       "step": "05",
-      "tag": "非成功终态"
+      "tag": "diagnostic/v2"
     },
     {
       "id": "verification-before-final",
@@ -123,7 +129,7 @@
       "id": "outcome-unknown",
       "type": "decision",
       "label": "结果不明 / 只读核对",
-      "sublabel": "未确认结果持续阻止自动重发",
+      "sublabel": "已关会话；核对最多一次",
       "lane": "terminal",
       "col": 1,
       "tag": "ambiguous"
@@ -169,9 +175,11 @@
       "variant": "security"
     },
     {
-      "id": "platform-accepts",
+      "id": "classify-mutation",
       "from": "final-action-clicked",
-      "to": "platform-accepted"
+      "to": "mutation-classified",
+      "label": "排空 mutation",
+      "labelAt": [633, 105]
     },
     {
       "id": "preclick-pause",
@@ -200,13 +208,15 @@
       "via": [[630, 157], [630, 230], [710, 230]]
     },
     {
-      "id": "accepted-readback-wait",
-      "from": "platform-accepted",
+      "id": "classified-readback-wait",
+      "from": "mutation-classified",
       "to": "verification-after-final",
       "variant": "security",
       "route": "straight",
       "fromSide": "bottom",
-      "toSide": "top"
+      "toSide": "top",
+      "label": "无唯一 Reel",
+      "labelAt": [710, 214]
     },
     {
       "id": "resume-readback-only",
@@ -227,12 +237,13 @@
       "toSide": "top"
     },
     {
-      "id": "accepted-readback-success",
-      "from": "platform-accepted",
+      "id": "classified-readback-success",
+      "from": "mutation-classified",
       "to": "readback-verified",
       "variant": "emphasis",
       "route": "right-channel",
-      "channelX": 980
+      "channelX": 980,
+      "label": "唯一列表命中"
     },
     {
       "id": "reconcile-found-reel",
@@ -263,16 +274,25 @@
       "items": [
         "授权消费、正式任务和 Page 级 claim 在同一事务完成",
         "内容列表基线失败时不得进入 final_action_claimed",
-        "claim 与实际点击分开记录，进程中断时保守核对"
+        "监听先挂载、点击前标记边界；claim 与实际点击分开记录"
       ]
     },
     {
       "dot": "rose",
       "title": "只读恢复",
       "items": [
-        "平台接受不等于成功，仍需同一 Page 的唯一 Reel",
+        "Mutation 的 data 或 errors 仅用于诊断，不等于发布回执",
         "点击后验证只恢复回读，绝不再次点击最终按钮",
         "仅有明确拒绝且完整核对无作品时，才确认未发布并允许新授权"
+      ]
+    },
+    {
+      "dot": "slate",
+      "title": "浏览器会话可解释",
+      "items": [
+        "后台就绪后记录 preflight、formal 或 reconciliation 会话打开",
+        "关闭原因固定记录为正常完成、安全失败、结果不明或中断",
+        "只在内存解析 mutation；落库仅存分类、计数、错误码和哈希"
       ]
     }
   ]

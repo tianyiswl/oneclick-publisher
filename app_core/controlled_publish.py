@@ -2905,6 +2905,7 @@ def _facebook_reconciliation_snapshot(task_id: int) -> dict[str, object]:
 async def _read_facebook_page_reconciliation(
     snapshot: Mapping[str, object],
 ):
+    from . import task_service
     from uploader.meta_uploader.content_list import (
         FacebookPageContentReader,
         FacebookReelRow,
@@ -2935,21 +2936,49 @@ async def _read_facebook_page_reconciliation(
         rows=rows,
         captured_at=clicked_at,
     )
-    async with _facebook_page_read_only_session(
-        str(snapshot.get("accountFile") or "")
-    ) as (context, verifier):
-        reader = FacebookPageContentReader(
-            context,
-            wait_for_verification=verifier,
+    task_id = int(snapshot.get("taskId") or 0)
+    opened = False
+    close_reason = "reconciliation_completed"
+    try:
+        async with _facebook_page_read_only_session(
+            str(snapshot.get("accountFile") or "")
+        ) as (context, verifier):
+            opened = True
+            task_service.record_facebook_browser_session_event(
+                task_id,
+                stage="opened",
+                purpose="reconciliation",
+            )
+            reader = FacebookPageContentReader(
+                context,
+                wait_for_verification=verifier,
+            )
+            return await reader.readback_unique_reel(
+                baseline=baseline,
+                expected_page_id=page_id,
+                expected_caption_sha256=str(
+                    (snapshot.get("formSnapshot") or {}).get("captionSha256") or ""
+                ),
+                clicked_at=clicked_at,
+            )
+    except BaseException as exc:
+        close_reason = (
+            "interrupted"
+            if isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError))
+            else "reconciliation_failed"
         )
-        return await reader.readback_unique_reel(
-            baseline=baseline,
-            expected_page_id=page_id,
-            expected_caption_sha256=str(
-                (snapshot.get("formSnapshot") or {}).get("captionSha256") or ""
-            ),
-            clicked_at=clicked_at,
-        )
+        raise
+    finally:
+        if opened:
+            try:
+                task_service.record_facebook_browser_session_event(
+                    task_id,
+                    stage="closed",
+                    purpose="reconciliation",
+                    close_reason=close_reason,
+                )
+            except Exception:
+                pass
 
 
 def _reconcile_facebook_page_publish_outcome_claimed(
@@ -2969,6 +2998,8 @@ def _reconcile_facebook_page_publish_outcome_claimed(
             "facebook_claim_lifecycle_invalid",
             "Facebook Page claim 当前不允许只读核对。",
         )
+    if task_service.facebook_reconciliation_session_already_opened(int(task_id)):
+        return project_task(task_service.get_task(int(task_id)))
     if task_service.facebook_reconciliation_owner_is_active(int(task_id)):
         return project_task(task_service.get_task(int(task_id)))
     reconcile_token = f"facebook-reconcile-{uuid.uuid4().hex}"
@@ -3676,6 +3707,85 @@ def _projected_error_code(message: str) -> str:
     )
 
 
+_FACEBOOK_BROWSER_EVENT_RE = re.compile(
+    r"^facebook_(preflight|formal|reconciliation)_browser_(opened|closed)$"
+)
+_FACEBOOK_BROWSER_CLOSE_REASONS = frozenset(
+    {
+        "preflight_completed",
+        "formal_completed",
+        "reconciliation_completed",
+        "outcome_unknown",
+        "safe_failure",
+        "reconciliation_failed",
+        "interrupted",
+    }
+)
+
+
+def _project_facebook_browser_session(
+    events: Iterable[Mapping[str, Any]],
+) -> dict[str, str] | None:
+    for raw_event in reversed(list(events)):
+        match = _FACEBOOK_BROWSER_EVENT_RE.fullmatch(
+            str(raw_event.get("eventType") or "")
+        )
+        if match is None:
+            continue
+        purpose, state = match.groups()
+        try:
+            detail = json.loads(str(raw_event.get("detailJson") or ""))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if (
+            not isinstance(detail, Mapping)
+            or str(detail.get("purpose") or "") != purpose
+            or str(detail.get("state") or "") != state
+        ):
+            continue
+        close_reason = str(detail.get("closeReason") or "")
+        if state == "opened" and close_reason:
+            continue
+        if state == "closed" and close_reason not in _FACEBOOK_BROWSER_CLOSE_REASONS:
+            continue
+        result = {
+            "state": state,
+            "purpose": purpose,
+            "closeReason": close_reason,
+            "message": " ".join(str(raw_event.get("message") or "").split()),
+        }
+        if not close_reason:
+            result.pop("closeReason")
+        return result
+    return None
+
+
+def _project_facebook_post_click_diagnostic(
+    events: Iterable[Mapping[str, Any]],
+    *,
+    expected_page_id: str,
+) -> dict[str, object] | None:
+    from uploader.meta_uploader.post_click_diagnostics import (
+        project_facebook_post_click_diagnostic,
+    )
+
+    for raw_event in reversed(list(events)):
+        if (
+            str(raw_event.get("eventType") or "")
+            != "facebook_post_click_diagnostic_captured"
+        ):
+            continue
+        try:
+            detail = json.loads(str(raw_event.get("detailJson") or ""))
+            return project_facebook_post_click_diagnostic(
+                detail,
+                expected_page_id=expected_page_id,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return None
+
+
 def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
     """输出给 Codex/本地 API 的稳定、无凭据任务 JSON。"""
 
@@ -3781,6 +3891,7 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
             payloads_by_type.setdefault(int(raw_payload.get("type") or 0), []).append(raw_payload)
     facebook_claim_state = ""
     facebook_claim_receipt: dict[str, object] = {}
+    facebook_claim_page_reference = ""
     if 9 in payloads_by_type and int(task.get("id") or 0) > 0:
         from .database import connect
 
@@ -3800,6 +3911,7 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
                 else None
             )
         if claim_row is not None:
+            facebook_claim_page_reference = str(claim_row["pageReference"] or "")
             facebook_evidence = _validated_facebook_page_claim_evidence(
                 dict(claim_row)
             )
@@ -4087,6 +4199,15 @@ def project_task(task: Mapping[str, Any] | None) -> dict[str, Any]:
         )
         if result.get("actionRequired") is not None:
             result["userAction"] = result["actionRequired"]
+        browser_session = _project_facebook_browser_session(events)
+        if browser_session is not None:
+            result["browserSession"] = browser_session
+        post_click_diagnostic = _project_facebook_post_click_diagnostic(
+            events,
+            expected_page_id=facebook_claim_page_reference,
+        )
+        if post_click_diagnostic is not None:
+            result["postClickDiagnostic"] = post_click_diagnostic
     silicon_payloads = [
         item
         for rows in payloads_by_type.values()

@@ -2696,6 +2696,180 @@ class FacebookPageTaskServiceTests(unittest.TestCase):
             )
         )
 
+    def test_second_inconclusive_reconcile_does_not_open_another_session(
+        self,
+    ) -> None:
+        task_id, _page_id = self.facebook_task(state="ambiguous")
+        with database.connect() as conn:
+            conn.execute(
+                """
+                UPDATE publish_task_items
+                SET status='failed', errorCode='facebook_publish_outcome_unknown'
+                WHERE taskId=? AND platformType=9
+                """,
+                (task_id,),
+            )
+            conn.execute(
+                """
+                UPDATE publish_tasks
+                SET status='failed', workerToken='stale-formal-owner',
+                    workerPid=12345,
+                    workerHeartbeatAt='2026-08-30T01:00:00+00:00'
+                WHERE id=?
+                """,
+                (task_id,),
+            )
+            conn.commit()
+        first, _calls, sessions = self.read_only_reconcile(
+            task_id,
+            FacebookReelMatch("none", None, 0, 0),
+        )
+        self.assertEqual((first["status"], first["phase"]), ("failed", "ambiguous"))
+        self.assertEqual(len(sessions), 1)
+
+        with patch.object(
+            controlled_publish,
+            "_facebook_page_read_only_session",
+            side_effect=AssertionError("second reconcile opened a browser"),
+            create=True,
+        ):
+            second = controlled_publish.reconcile_facebook_page_publish_outcome(
+                task_id
+            )
+
+        self.assertEqual((second["status"], second["phase"]), ("failed", "ambiguous"))
+        event_types = [
+            event["eventType"]
+            for event in task_service.get_task(task_id)["events"]
+        ]
+        self.assertEqual(event_types.count("facebook_reconciliation_worker_claimed"), 1)
+        self.assertEqual(event_types.count("facebook_reconciliation_outcome_unknown"), 1)
+
+    def test_browser_lifecycle_is_exposed_in_task_status(self) -> None:
+        task_id, _page_id = self.facebook_task(state="reserved")
+
+        task_service.record_facebook_browser_session_event(
+            task_id,
+            stage="opened",
+            purpose="preflight",
+        )
+        task_service.record_facebook_browser_session_event(
+            task_id,
+            stage="closed",
+            purpose="preflight",
+            close_reason="preflight_completed",
+        )
+
+        projected = self.projection(task_id)
+        self.assertEqual(
+            projected["browserSession"],
+            {
+                "state": "closed",
+                "purpose": "preflight",
+                "closeReason": "preflight_completed",
+                "message": "Facebook Page 预检完成，浏览器已正常关闭",
+            },
+        )
+        stored = task_service.get_task(task_id)["events"]
+        lifecycle = [
+            event for event in stored
+            if event["eventType"].startswith("facebook_preflight_browser_")
+        ]
+        self.assertEqual(len(lifecycle), 2)
+        self.assertEqual(
+            json.loads(lifecycle[-1]["detailJson"]),
+            {
+                "closeReason": "preflight_completed",
+                "purpose": "preflight",
+                "state": "closed",
+            },
+        )
+
+    def test_post_click_diagnostic_is_idempotent_projected_and_lock_preserving(
+        self,
+    ) -> None:
+        task_id, page_id = self.facebook_task(state="final_action_clicked")
+        diagnostic = {
+            "schemaVersion": "facebook-post-click-diagnostic/v1",
+            "pageId": page_id,
+            "samples": [
+                {
+                    "phase": "post_click_observed",
+                    "capturedAt": "2026-08-30T02:00:01+00:00",
+                    "captureStatus": "ok",
+                    "pageUrl": (
+                        "https://business.facebook.com/latest/reels_composer/"
+                        f"?asset_id={page_id}"
+                    ),
+                    "postClickState": "composer_unchanged",
+                    "dialogs": [],
+                    "notices": [],
+                    "finalButton": {
+                        "label": "Publish",
+                        "visibleCount": 1,
+                        "enabled": False,
+                    },
+                }
+            ],
+            "popupUrls": [],
+            "networkResults": [
+                {
+                    "method": "POST",
+                    "host": "business.facebook.com",
+                    "path": "/api/graphql/",
+                    "resourceType": "xhr",
+                    "status": 200,
+                    "ok": True,
+                }
+            ],
+            "networkResultCount": 1,
+            "networkDroppedCount": 0,
+        }
+        self.assertTrue(
+            hasattr(task_service, "record_facebook_post_click_diagnostic")
+        )
+        task_service.record_facebook_post_click_diagnostic(task_id, diagnostic)
+        task_service.record_facebook_post_click_diagnostic(task_id, diagnostic)
+        conflicting = json.loads(json.dumps(diagnostic))
+        conflicting["samples"][0]["finalButton"]["enabled"] = True
+        with self.assertRaises(ValueError):
+            task_service.record_facebook_post_click_diagnostic(
+                task_id,
+                conflicting,
+            )
+
+        projected = self.projection(task_id)
+        self.assertEqual(projected["postClickDiagnostic"], diagnostic)
+        stored = task_service.get_task(task_id)["events"]
+        diagnostics = [
+            event
+            for event in stored
+            if event["eventType"] == "facebook_post_click_diagnostic_captured"
+        ]
+        self.assertEqual(len(diagnostics), 1)
+        self.assertEqual(json.loads(diagnostics[0]["detailJson"]), diagnostic)
+        claim = self.claim(task_id)
+        self.assertEqual(claim["state"], "final_action_clicked")
+        self.assertEqual(int(claim["blocksReplay"]), 1)
+
+        forged = json.loads(json.dumps(diagnostic))
+        forged["pageId"] = "1002"
+        forged["samples"][0]["pageUrl"] = (
+            "https://business.facebook.com/latest/reels_composer/"
+            "?asset_id=1002"
+        )
+        with database.connect() as conn:
+            conn.execute(
+                """
+                UPDATE publish_task_events SET detailJson = ?
+                WHERE taskId = ?
+                  AND eventType = 'facebook_post_click_diagnostic_captured'
+                """,
+                (_canonical_json(forged), task_id),
+            )
+            conn.commit()
+        self.assertNotIn("postClickDiagnostic", self.projection(task_id))
+
     def test_corrupted_snapshots_or_hashes_fail_closed_before_session(self) -> None:
         corruptions = (
             ("baselineJson", '{"pageId":"corrupt"}'),
