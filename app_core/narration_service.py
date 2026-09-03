@@ -467,9 +467,10 @@ def synthesize_system_narration(
             "当前系统暂不支持本机自动配音",
         )
 
-    target_dir = Path(output_dir).expanduser().resolve()
+    target_dir: Path | None = None
     created_target_dir = False
     try:
+        target_dir = Path(output_dir).expanduser().resolve()
         target_dir.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(
             prefix=".narration-",
@@ -545,7 +546,7 @@ def synthesize_system_narration(
     except MontageFailure:
         raise
     except OSError as exc:
-        if created_target_dir:
+        if created_target_dir and target_dir is not None:
             try:
                 target_dir.rmdir()
             except OSError:

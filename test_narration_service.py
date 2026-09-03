@@ -357,6 +357,22 @@ class NarrationServiceTests(unittest.TestCase):
             )
             self.assertNotIn("不能泄漏的文案", str(caught.exception))
 
+    def test_output_path_resolution_error_has_stable_error(self) -> None:
+        with patch.object(
+            Path,
+            "resolve",
+            side_effect=PermissionError("denied"),
+        ), self.assertRaises(Exception) as caught:
+            synthesize_system_narration(
+                "不能泄漏的文案",
+                self.root / "resolve-failure",
+                runtime=self.runtime,
+                platform_name="darwin",
+            )
+        self.assertIsInstance(caught.exception, MontageFailure)
+        self.assertEqual(caught.exception.code, "montage_narration_synthesis_failed")
+        self.assertNotIn("不能泄漏的文案", str(caught.exception))
+
     def test_windows_script_write_error_has_stable_error(self) -> None:
         text_path = self.root / "narration.txt"
         text_path.write_text("测试", encoding="utf-8")
