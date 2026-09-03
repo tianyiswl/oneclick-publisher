@@ -24,6 +24,7 @@ REQUEST_FIELDS = frozenset(
         "seed",
         "title_template",
         "body_template",
+        "narration_text",
     }
 )
 
@@ -61,6 +62,7 @@ class MontageRequest:
     seed: int
     title_template: str
     body_template: str
+    narration_text: str
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, object]) -> "MontageRequest":
@@ -125,7 +127,7 @@ class MontageRequest:
             code="montage_clip_duration_invalid",
             label="镜头时长",
         )
-        if not 500 <= clip_duration_ms <= 10_000 or clip_duration_ms > target_duration_ms:
+        if not 500 <= clip_duration_ms <= 10_000:
             raise MontageFailure(
                 "montage_clip_duration_invalid",
                 "镜头时长必须在 0.5–10 秒之间，且不能超过成片时长",
@@ -136,8 +138,26 @@ class MontageRequest:
             raise MontageFailure("montage_reuse_mode_invalid", "复用设置无效")
 
         audio_mode = str(raw.get("audio_mode") or "").strip().lower()
-        if audio_mode not in {"mute", "source"}:
-            raise MontageFailure("montage_audio_mode_invalid", "音频模式只能是静音或保留环境原声")
+        if audio_mode not in {"mute", "source", "narration"}:
+            raise MontageFailure(
+                "montage_audio_mode_invalid",
+                "音频模式只能是静音、保留环境原声或系统自动配音",
+            )
+
+        narration_value = raw.get("narration_text", "")
+        if not isinstance(narration_value, str):
+            raise MontageFailure("montage_narration_text_required", "配音文案必须是文字")
+        narration_text = narration_value.strip()
+        if audio_mode == "narration" and not narration_text:
+            raise MontageFailure("montage_narration_text_required", "请输入需要配音的解说文案")
+        if audio_mode != "narration":
+            narration_text = ""
+
+        if audio_mode != "narration" and clip_duration_ms > target_duration_ms:
+            raise MontageFailure(
+                "montage_clip_duration_invalid",
+                "镜头时长不能超过成片时长",
+            )
 
         source_audio_confirmed = raw.get("source_audio_confirmed", False)
         if not isinstance(source_audio_confirmed, bool):
@@ -173,6 +193,7 @@ class MontageRequest:
             seed=seed,
             title_template=title_template.strip(),
             body_template=body_template.strip(),
+            narration_text=narration_text,
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -187,6 +208,7 @@ class MontageRequest:
             "seed": self.seed,
             "title_template": self.title_template,
             "body_template": self.body_template,
+            "narration_text": self.narration_text,
         }
 
 

@@ -36,12 +36,39 @@ class MontageModelsTests(unittest.TestCase):
             "clip_duration_ms": 2_000,
             "allow_reuse": False,
             "audio_mode": "mute",
+            "narration_text": "",
             "seed": 42,
             "title_template": "[今天|这次]看[新品|新款]",
             "body_template": "重点看看[做工|细节]。",
         }
         raw.update(overrides)
         return MontageRequest.from_mapping(raw)
+
+    def test_narration_mode_requires_text_and_normalizes_it(self) -> None:
+        with self.assertRaises(MontageFailure) as missing:
+            self.request(audio_mode="narration", narration_text="  ")
+        self.assertEqual(missing.exception.code, "montage_narration_text_required")
+
+        request = self.request(
+            audio_mode="narration",
+            narration_text="  你好，这是一段解说。  ",
+        )
+        self.assertEqual(request.narration_text, "你好，这是一段解说。")
+        self.assertFalse(request.source_audio_confirmed)
+        self.assertEqual(request.to_dict()["narration_text"], "你好，这是一段解说。")
+
+    def test_non_narration_mode_ignores_stale_narration_text(self) -> None:
+        request = self.request(audio_mode="mute", narration_text="不会参与生成")
+        self.assertEqual(request.narration_text, "")
+
+    def test_narration_mode_does_not_compare_clip_with_ignored_ui_target(self) -> None:
+        request = self.request(
+            audio_mode="narration",
+            narration_text="这段配音最终会超过五秒。",
+            target_duration_ms=5_000,
+            clip_duration_ms=10_000,
+        )
+        self.assertEqual(request.clip_duration_ms, 10_000)
 
     def asset(
         self,
