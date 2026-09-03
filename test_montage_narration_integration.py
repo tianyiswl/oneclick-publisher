@@ -21,6 +21,35 @@ from app_core.narration_service import (
 )
 
 
+def _probe_all_audio_streams(
+    path: Path,
+    *,
+    runtime: MontageRuntime,
+) -> tuple[dict[str, object], ...]:
+    completed = subprocess.run(
+        [
+            str(runtime.ffprobe),
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=index,codec_type,codec_name,sample_rate,channels,duration",
+            "-of",
+            "json",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(completed.stdout)
+    streams = payload.get("streams")
+    if not isinstance(streams, list):
+        raise AssertionError("ffprobe did not return an audio stream list")
+    return tuple(stream for stream in streams if isinstance(stream, dict))
+
+
 class MontageNarrationIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -28,6 +57,59 @@ class MontageNarrationIntegrationTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
+
+    @unittest.skipUnless(
+        sys.platform == "darwin"
+        and shutil.which("ffmpeg")
+        and shutil.which("ffprobe"),
+        "requires macOS and complete FFmpeg",
+    )
+    def test_audio_stream_enumerator_sees_both_tracks(self) -> None:
+        ffmpeg = Path(shutil.which("ffmpeg") or "")
+        ffprobe = Path(shutil.which("ffprobe") or "")
+        runtime = MontageRuntime(ffmpeg=ffmpeg, ffprobe=ffprobe)
+        target = self.root / "two-audio-streams.mp4"
+        subprocess.run(
+            [
+                str(ffmpeg),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=160x90:r=30",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=880:sample_rate=48000",
+                "-t",
+                "1",
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-map",
+                "2:a:0",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                str(target),
+            ],
+            check=True,
+        )
+
+        streams = _probe_all_audio_streams(target, runtime=runtime)
+
+        self.assertEqual(len(streams), 2)
 
     @unittest.skipUnless(
         sys.platform == "darwin"
@@ -173,7 +255,13 @@ class MontageNarrationIntegrationTests(unittest.TestCase):
             all(Path(str(item["output_path"])).is_file() for item in result.outputs)
         )
         for item in result.outputs:
-            output_readback = probe_audio_readback(Path(str(item["output_path"])), runtime=runtime)
+            output_path = Path(str(item["output_path"]))
+            audio_streams = _probe_all_audio_streams(output_path, runtime=runtime)
+            self.assertEqual(len(audio_streams), 1)
+            self.assertEqual(audio_streams[0]["codec_name"], "aac")
+            self.assertEqual(int(str(audio_streams[0]["sample_rate"])), 48_000)
+            self.assertEqual(audio_streams[0]["channels"], 2)
+            output_readback = probe_audio_readback(output_path, runtime=runtime)
             self.assertEqual(output_readback.codec_name, "aac")
             self.assertEqual(output_readback.sample_rate, 48_000)
             self.assertEqual(output_readback.channels, 2)
@@ -184,6 +272,7 @@ class MontageNarrationIntegrationTests(unittest.TestCase):
             (result.batch_dir / "request.json").read_text(encoding="utf-8")
         )
         self.assertEqual(request_receipt["schema_version"], "oneclick-montage-request/v2")
+        self.assertNotIn("narration_text", request_receipt)
         self.assertEqual(receipt["schema_version"], "oneclick-montage-batch-receipt/v2")
         self.assertEqual(receipt["batch_id"], "M-NARRATION-INTEGRATION")
         self.assertEqual(receipt["status"], "success")
