@@ -180,8 +180,12 @@ class AutomaticMontagePage(QWidget):
         self.target_duration.setRange(5, 180)
         self.target_duration.setValue(30)
         self.target_duration.setSuffix(" 秒")
-        grid.addWidget(QLabel("每条总时长"), 1, 0)
+        self.target_duration_label = QLabel("每条总时长")
+        self.target_duration_follow_label = QLabel("跟随配音")
+        self.target_duration_follow_label.setProperty("role", "caption")
+        grid.addWidget(self.target_duration_label, 1, 0)
         grid.addWidget(self.target_duration, 1, 1)
+        grid.addWidget(self.target_duration_follow_label, 1, 1)
 
         self.clip_duration = QDoubleSpinBox()
         self.clip_duration.setRange(0.5, 10.0)
@@ -195,6 +199,7 @@ class AutomaticMontagePage(QWidget):
         self.audio_mode = QComboBox()
         self.audio_mode.addItem("静音", "mute")
         self.audio_mode.addItem("保留环境原声（仅无人声素材）", "source")
+        self.audio_mode.addItem("系统自动配音", "narration")
         grid.addWidget(QLabel("声音"), 3, 0)
         grid.addWidget(self.audio_mode, 3, 1)
 
@@ -213,8 +218,20 @@ class AutomaticMontagePage(QWidget):
             "固定时长切片无法保证口播语句完整；有人声口播时请使用静音混剪"
         )
         layout.addWidget(self.source_audio_confirmation)
-        self.audio_mode.currentIndexChanged.connect(self._sync_audio_confirmation)
-        self._sync_audio_confirmation()
+        self.narration_panel = QFrame()
+        narration_layout = QVBoxLayout(self.narration_panel)
+        narration_layout.setContentsMargins(0, 0, 0, 0)
+        narration_layout.addWidget(QLabel("配音文案"))
+        self.narration_text = ImeAwarePlainTextEdit()
+        self.narration_text.setPlaceholderText("输入需要完整朗读的中文解说；整批视频共用这一条配音")
+        self.narration_text.setMaximumHeight(120)
+        narration_layout.addWidget(self.narration_text)
+        narration_hint = QLabel("系统会移除素材原声，视频时长由配音决定。")
+        narration_hint.setProperty("role", "caption")
+        narration_layout.addWidget(narration_hint)
+        layout.addWidget(self.narration_panel)
+        self.audio_mode.currentIndexChanged.connect(self._sync_audio_mode_controls)
+        self._sync_audio_mode_controls()
 
         self.allow_reuse = QCheckBox("素材不足时允许受控复用")
         self.allow_reuse.setToolTip("默认不复用同一时间段；勾选后按使用次数最少优先复用")
@@ -332,11 +349,16 @@ class AutomaticMontagePage(QWidget):
         ):
             self.source_audio_confirmation.setChecked(False)
 
-    def _sync_audio_confirmation(self, _index: int | None = None) -> None:
-        source_mode = self.audio_mode.currentData() == "source"
+    def _sync_audio_mode_controls(self, _index: int | None = None) -> None:
+        mode = self.audio_mode.currentData()
+        source_mode = mode == "source"
+        narration_mode = mode == "narration"
         self.source_audio_confirmation.setVisible(source_mode)
         if not source_mode:
             self.source_audio_confirmation.setChecked(False)
+        self.narration_panel.setVisible(narration_mode)
+        self.target_duration.setVisible(not narration_mode)
+        self.target_duration_follow_label.setVisible(narration_mode)
 
     def select_all_sources(self) -> None:
         self.source_list.blockSignals(True)
@@ -384,6 +406,7 @@ class AutomaticMontagePage(QWidget):
                 "seed": self.seed.value(),
                 "title_template": self.title_template.text(),
                 "body_template": self.body_template.toPlainText(),
+                "narration_text": self.narration_text.toPlainText(),
             }
         )
 
@@ -421,6 +444,13 @@ class AutomaticMontagePage(QWidget):
             total = max(1, int(event.get("total") or 1))
             self.progress_bar.setValue(2 + round(current / total * 13))
             self.status_label.setText(f"正在读取素材 {current}/{total}：{event.get('filename') or ''}")
+        elif stage == "narration_synthesizing":
+            self.progress_bar.setValue(16)
+            self.status_label.setText("正在生成系统配音…")
+        elif stage == "narration_readback":
+            duration = int(event.get("master_duration_ms") or 0) / 1000
+            self.progress_bar.setValue(22)
+            self.status_label.setText(f"配音已生成，成片时长 {duration:g} 秒；正在安排镜头…")
         elif stage == "planning":
             self.progress_bar.setValue(18)
             self.status_label.setText("正在安排不重复镜头…")
@@ -443,12 +473,20 @@ class AutomaticMontagePage(QWidget):
         self.progress_bar.setValue(100)
         success = sum(item.get("status") == "success" for item in result.outputs)
         failed = len(result.outputs) - success
+        narration = getattr(result, "narration", None)
+        narration_summary = ""
+        if isinstance(narration, dict):
+            voice_id = str(narration.get("voice_id") or "系统配音")
+            duration = int(narration.get("master_duration_ms") or 0) / 1000
+            narration_summary = f"；系统配音：{voice_id}，主音轨 {duration:g} 秒"
         if failed:
             self.status_label.setStyleSheet(f"color: {COLORS['warning']};")
-            self.status_label.setText(f"生成结束：成功 {success} 条，失败 {failed} 条；可在结果中查看")
+            self.status_label.setText(
+                f"生成结束：成功 {success} 条，失败 {failed} 条{narration_summary}；可在结果中查看"
+            )
         else:
             self.status_label.setStyleSheet(f"color: {COLORS['success']};")
-            self.status_label.setText(f"已生成 {success} 条，检查无误后再进入发布")
+            self.status_label.setText(f"已生成 {success} 条{narration_summary}，检查无误后再进入发布")
 
     def _on_error(self, message: str) -> None:
         self.status_label.setStyleSheet(f"color: {COLORS['danger']};")
