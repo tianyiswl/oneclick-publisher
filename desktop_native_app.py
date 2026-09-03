@@ -517,7 +517,7 @@ def start_authorized_wechat_schedule(
     }
 
     page = window.publish
-    window._set_current_page(3)
+    window.set_current_page_by_key("publish")
     page.refresh(force=True)
     page._select_content_type(2)
     page.preflight.setChecked(False)
