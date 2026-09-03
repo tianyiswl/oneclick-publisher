@@ -2,7 +2,7 @@
   "schema_version": 1,
   "diagram_type": "architecture",
   "meta": {
-    "title": "自动混剪系统配音架构（设计）",
+    "title": "自动混剪系统配音架构（源码实现）",
     "output": "docs/architecture/automatic-montage-system-narration.architecture.html",
     "quality_profile": "showcase",
     "viewBox": [1850, 720],
@@ -17,7 +17,7 @@
         "id": "platform_adapters",
         "label": "双端离线配音",
         "focus": ["speech_adapter", "macos_voice", "windows_voice", "audio_normalizer"],
-        "note": "Mac 与 Windows 分别调用系统中文声音，不依赖云端模型或密钥。"
+        "note": "Mac 真实批次已验证；Windows 仅完成适配器合同测试，仍需真机验收。"
       },
       {
         "id": "safety_and_review",
@@ -56,7 +56,7 @@
       "id": "macos_voice",
       "type": "external",
       "label": "macOS 系统语音",
-      "sublabel": "say · 本机离线",
+      "sublabel": "say · 真实批次通过",
       "pos": [480, 80],
       "size": [150, 64]
     },
@@ -64,7 +64,7 @@
       "id": "windows_voice",
       "type": "external",
       "label": "Windows 系统语音",
-      "sublabel": "SAPI · 本机离线",
+      "sublabel": "SAPI · 仅合同测试",
       "pos": [480, 460],
       "size": [150, 64]
     },
@@ -104,7 +104,7 @@
       "id": "batch_receipt",
       "type": "database",
       "label": "本地批次回执",
-      "sublabel": "声音、时长与哈希证据",
+      "sublabel": "声音、时长与哈希摘要",
       "pos": [1390, 80],
       "size": [170, 68]
     },
@@ -120,7 +120,7 @@
       "id": "human_review",
       "type": "external",
       "label": "人工播放检查",
-      "sublabel": "节奏与声音通过后再发布",
+      "sublabel": "音色、语速与末句待确认",
       "pos": [1610, 80],
       "size": [170, 68]
     }
@@ -137,7 +137,7 @@
       "id": "ui_to_batch",
       "from": "montage_ui",
       "to": "batch_service",
-      "label": "文字与混剪设置",
+      "label": "运行时文字与设置",
       "variant": "emphasis",
       "labelDy": -30
     },
@@ -231,17 +231,17 @@
       "title": "本机与隐私",
       "items": [
         "只调用系统已安装中文声音",
-        "文案和音频不上传云端",
-        "Mac 与 Windows 音色可以不同，同一批内必须一致"
+        "配音正文不写入 request.json 或批次回执",
+        "文案和音频不上传云端"
       ]
     },
     {
       "dot": "rose",
       "title": "当前状态",
       "items": [
-        "本图是已批准设计，不代表功能已经实现",
-        "没有中文声音时明确失败，不回退为英文",
-        "本地成功仍需人工播放确认"
+        "Mac 三条成片机器回读通过，人工听感待确认",
+        "Windows 仅合同测试，未真机或安装包验收",
+        "当前是未发布源码，没有递增版本或打包"
       ]
     }
   ]

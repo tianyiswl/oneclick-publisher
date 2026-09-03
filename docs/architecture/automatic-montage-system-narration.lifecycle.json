@@ -2,7 +2,7 @@
   "schema_version": 1,
   "diagram_type": "lifecycle",
   "meta": {
-    "title": "自动混剪系统配音生命周期（设计）",
+    "title": "自动混剪系统配音生命周期（源码实现）",
     "output": "docs/architecture/automatic-montage-system-narration.lifecycle.html",
     "quality_profile": "showcase",
     "viewBox": [1400, 700],
@@ -46,7 +46,7 @@
       "id": "input_ready",
       "type": "start",
       "label": "输入就绪",
-      "sublabel": "素材、数量与配音文案",
+      "sublabel": "素材、数量与运行时文案",
       "lane": "main",
       "col": 0,
       "step": "01"
@@ -109,7 +109,7 @@
       "id": "review_ready",
       "type": "success",
       "label": "全部成片待检查",
-      "sublabel": "音轨、时长和哈希已回读",
+      "sublabel": "机器回读通过 · 听感待确认",
       "lane": "terminal",
       "col": 2,
       "tag": "success"
@@ -240,7 +240,7 @@
       "items": [
         "配音生成和时长回读发生在镜头规划之前",
         "整批只产生一份规范化配音",
-        "每条成片必须回读到音轨后才算成功"
+        "请求和批次回执不持久化配音正文"
       ]
     },
     {
@@ -257,8 +257,8 @@
       "title": "终态边界",
       "items": [
         "成功、部分成功、失败均写原子批次回执",
-        "本地生成完成不等于已进入发布任务",
-        "人工播放检查仍是进入发布前的必要步骤"
+        "Mac 真实批次机器回读通过，听感仍待人工确认",
+        "Windows 仅合同测试；本地成功不等于已进入发布任务"
       ]
     }
   ]

@@ -122,6 +122,19 @@ class MontageModelsTests(unittest.TestCase):
             self.request(source_paths=[str(text_file)])
         self.assertEqual(bad_source.exception.code, "montage_source_type_unsupported")
 
+    def test_narration_clip_limit_message_does_not_reference_hidden_target(self) -> None:
+        with self.assertRaises(MontageFailure) as invalid_clip:
+            self.request(
+                audio_mode="narration",
+                narration_text="一段长解说",
+                target_duration_ms=5_000,
+                clip_duration_ms=10_001,
+            )
+
+        self.assertEqual(invalid_clip.exception.code, "montage_clip_duration_invalid")
+        self.assertEqual(str(invalid_clip.exception), "镜头时长必须在 0.5–10 秒之间")
+        self.assertNotIn("成片时长", str(invalid_clip.exception))
+
     def test_source_audio_requires_explicit_no_speech_confirmation(self) -> None:
         with self.assertRaises(MontageFailure) as unconfirmed:
             self.request(audio_mode="source")

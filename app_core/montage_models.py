@@ -130,7 +130,7 @@ class MontageRequest:
         if not 500 <= clip_duration_ms <= 10_000:
             raise MontageFailure(
                 "montage_clip_duration_invalid",
-                "镜头时长必须在 0.5–10 秒之间，且不能超过成片时长",
+                "镜头时长必须在 0.5–10 秒之间",
             )
 
         allow_reuse = raw.get("allow_reuse", False)
