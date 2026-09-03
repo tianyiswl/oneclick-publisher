@@ -1,0 +1,265 @@
+{
+  "schema_version": 1,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "自动混剪系统配音生命周期（设计）",
+    "output": "docs/architecture/automatic-montage-system-narration.lifecycle.html",
+    "quality_profile": "showcase",
+    "viewBox": [1400, 700],
+    "views": [
+      {
+        "id": "happy_path",
+        "label": "正常生成",
+        "focus": ["input_ready", "speech_generating", "duration_readback", "clip_planning", "batch_rendering", "review_ready"],
+        "note": "一次配音驱动整批镜头计划和最终音轨。"
+      },
+      {
+        "id": "recoverable_errors",
+        "label": "可修复失败",
+        "focus": ["pre_render_failure", "output_failed"],
+        "note": "错误保留明确原因；修正输入或环境后才允许重新开始。"
+      },
+      {
+        "id": "batch_outcomes",
+        "label": "批次终态",
+        "focus": ["batch_rendering", "review_ready", "partial_ready", "batch_failed"],
+        "note": "成功、部分成功和失败均写入终态回执，不遗留运行中状态。"
+      }
+    ]
+  },
+  "lanes": [
+    {
+      "id": "main",
+      "label": "主生成链路"
+    },
+    {
+      "id": "recovery",
+      "label": "安全停止与修复"
+    },
+    {
+      "id": "terminal",
+      "label": "批次终态"
+    }
+  ],
+  "states": [
+    {
+      "id": "input_ready",
+      "type": "start",
+      "label": "输入就绪",
+      "sublabel": "素材、数量与配音文案",
+      "lane": "main",
+      "col": 0,
+      "step": "01"
+    },
+    {
+      "id": "speech_generating",
+      "type": "active",
+      "label": "生成系统配音",
+      "sublabel": "整批只合成一次",
+      "lane": "main",
+      "col": 1,
+      "step": "02"
+    },
+    {
+      "id": "duration_readback",
+      "type": "active",
+      "label": "回读配音时长",
+      "sublabel": "增加 0.3 秒尾部余量",
+      "lane": "main",
+      "col": 2,
+      "step": "03"
+    },
+    {
+      "id": "clip_planning",
+      "type": "active",
+      "label": "规划不重复镜头",
+      "sublabel": "以配音时长为目标",
+      "lane": "main",
+      "col": 3,
+      "step": "04"
+    },
+    {
+      "id": "batch_rendering",
+      "type": "active",
+      "label": "批量渲染与回读",
+      "sublabel": "统一配音写入每条成片",
+      "lane": "main",
+      "col": 4,
+      "step": "05"
+    },
+    {
+      "id": "pre_render_failure",
+      "type": "failure",
+      "label": "生成前安全停止",
+      "sublabel": "声音、时长或素材容量不合格",
+      "lane": "recovery",
+      "col": 0,
+      "tag": "可修复"
+    },
+    {
+      "id": "output_failed",
+      "type": "failure",
+      "label": "单条成片失败",
+      "sublabel": "其余成片继续处理",
+      "lane": "recovery",
+      "col": 1,
+      "tag": "有界重试"
+    },
+    {
+      "id": "review_ready",
+      "type": "success",
+      "label": "全部成片待检查",
+      "sublabel": "音轨、时长和哈希已回读",
+      "lane": "terminal",
+      "col": 2,
+      "tag": "success"
+    },
+    {
+      "id": "partial_ready",
+      "type": "neutral",
+      "label": "部分成片待检查",
+      "sublabel": "成功项与失败项均有回执",
+      "lane": "terminal",
+      "col": 1,
+      "tag": "partial_failure"
+    },
+    {
+      "id": "batch_failed",
+      "type": "failure",
+      "label": "批次失败",
+      "sublabel": "没有生成可用成片",
+      "lane": "terminal",
+      "col": 0,
+      "tag": "failed"
+    }
+  ],
+  "transitions": [
+    {
+      "id": "input_to_speech",
+      "from": "input_ready",
+      "to": "speech_generating",
+      "variant": "emphasis"
+    },
+    {
+      "id": "speech_to_duration",
+      "from": "speech_generating",
+      "to": "duration_readback"
+    },
+    {
+      "id": "duration_to_plan",
+      "from": "duration_readback",
+      "to": "clip_planning"
+    },
+    {
+      "id": "plan_to_render",
+      "from": "clip_planning",
+      "to": "batch_rendering"
+    },
+    {
+      "id": "render_to_success",
+      "from": "batch_rendering",
+      "to": "review_ready",
+      "variant": "emphasis",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "straight"
+    },
+    {
+      "id": "speech_to_pre_render_failure",
+      "from": "speech_generating",
+      "to": "pre_render_failure",
+      "variant": "security",
+      "route": "drop"
+    },
+    {
+      "id": "duration_to_error",
+      "from": "duration_readback",
+      "to": "pre_render_failure",
+      "variant": "security",
+      "route": "drop"
+    },
+    {
+      "id": "plan_to_capacity",
+      "from": "clip_planning",
+      "to": "pre_render_failure",
+      "variant": "security",
+      "route": "drop"
+    },
+    {
+      "id": "pre_render_failure_retry",
+      "from": "pre_render_failure",
+      "to": "input_ready",
+      "variant": "emphasis",
+      "route": "left-channel"
+    },
+    {
+      "id": "render_to_output_error",
+      "from": "batch_rendering",
+      "to": "output_failed",
+      "variant": "security",
+      "route": "drop"
+    },
+    {
+      "id": "output_error_continue",
+      "from": "output_failed",
+      "to": "batch_rendering",
+      "variant": "emphasis",
+      "route": "right-channel"
+    },
+    {
+      "id": "output_to_partial",
+      "from": "output_failed",
+      "to": "partial_ready",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "straight"
+    },
+    {
+      "id": "output_to_failed",
+      "from": "output_failed",
+      "to": "batch_failed",
+      "variant": "security",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "drop"
+    },
+    {
+      "id": "pre_render_to_failed",
+      "from": "pre_render_failure",
+      "to": "batch_failed",
+      "variant": "security",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "straight"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "正常路径",
+      "items": [
+        "配音生成和时长回读发生在镜头规划之前",
+        "整批只产生一份规范化配音",
+        "每条成片必须回读到音轨后才算成功"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "可修复失败",
+      "items": [
+        "缺少中文声音、文案过长和素材容量不足都在渲染前停止",
+        "修正条件后重新创建批次，不复用半成品",
+        "单条渲染失败不阻塞后续成片"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "终态边界",
+      "items": [
+        "成功、部分成功、失败均写原子批次回执",
+        "本地生成完成不等于已进入发布任务",
+        "人工播放检查仍是进入发布前的必要步骤"
+      ]
+    }
+  ]
+}

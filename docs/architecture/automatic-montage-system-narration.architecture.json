@@ -1,0 +1,248 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "自动混剪系统配音架构（设计）",
+    "output": "docs/architecture/automatic-montage-system-narration.architecture.html",
+    "quality_profile": "showcase",
+    "viewBox": [1850, 720],
+    "views": [
+      {
+        "id": "main_path",
+        "label": "主生成链路",
+        "focus": ["montage_ui", "batch_service", "speech_adapter", "audio_normalizer", "duration_probe", "clip_planner", "video_renderer", "batch_receipt"],
+        "note": "配音只合成一次，时长决定镜头计划，同一音频复用到整批成片。"
+      },
+      {
+        "id": "platform_adapters",
+        "label": "双端离线配音",
+        "focus": ["speech_adapter", "macos_voice", "windows_voice", "audio_normalizer"],
+        "note": "Mac 与 Windows 分别调用系统中文声音，不依赖云端模型或密钥。"
+      },
+      {
+        "id": "safety_and_review",
+        "label": "失败与人工检查",
+        "focus": ["speech_adapter", "duration_probe", "video_renderer", "failure_receipt", "batch_receipt", "human_review"],
+        "note": "任何关键回读失败都停止对应阶段；本地成片仍须人工播放确认。"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "montage_ui",
+      "type": "frontend",
+      "label": "自动混剪页面",
+      "sublabel": "配音文案与批量设置",
+      "pos": [40, 270],
+      "size": [150, 68]
+    },
+    {
+      "id": "batch_service",
+      "type": "backend",
+      "label": "混剪批次服务",
+      "sublabel": "校验请求并编排阶段",
+      "pos": [250, 270],
+      "size": [160, 68]
+    },
+    {
+      "id": "speech_adapter",
+      "type": "backend",
+      "label": "系统配音适配器",
+      "sublabel": "中文声音自动选择",
+      "pos": [470, 270],
+      "size": [170, 68]
+    },
+    {
+      "id": "macos_voice",
+      "type": "external",
+      "label": "macOS 系统语音",
+      "sublabel": "say · 本机离线",
+      "pos": [480, 80],
+      "size": [150, 64]
+    },
+    {
+      "id": "windows_voice",
+      "type": "external",
+      "label": "Windows 系统语音",
+      "sublabel": "SAPI · 本机离线",
+      "pos": [480, 460],
+      "size": [150, 64]
+    },
+    {
+      "id": "audio_normalizer",
+      "type": "backend",
+      "label": "音频规范化",
+      "sublabel": "FFmpeg · 48kHz AAC",
+      "pos": [700, 270],
+      "size": [160, 68]
+    },
+    {
+      "id": "duration_probe",
+      "type": "backend",
+      "label": "配音时长回读",
+      "sublabel": "尾部增加 0.3 秒余量",
+      "pos": [920, 270],
+      "size": [170, 68]
+    },
+    {
+      "id": "clip_planner",
+      "type": "backend",
+      "label": "镜头计划器",
+      "sublabel": "按配音时长排不重复窗口",
+      "pos": [1150, 270],
+      "size": [180, 68]
+    },
+    {
+      "id": "video_renderer",
+      "type": "backend",
+      "label": "成片渲染器",
+      "sublabel": "每条复用同一配音",
+      "pos": [1390, 270],
+      "size": [170, 68]
+    },
+    {
+      "id": "batch_receipt",
+      "type": "database",
+      "label": "本地批次回执",
+      "sublabel": "声音、时长与哈希证据",
+      "pos": [1390, 80],
+      "size": [170, 68]
+    },
+    {
+      "id": "failure_receipt",
+      "type": "security",
+      "label": "安全失败终态",
+      "sublabel": "稳定错误码 · 不静默降级",
+      "pos": [245, 460],
+      "size": [170, 68]
+    },
+    {
+      "id": "human_review",
+      "type": "external",
+      "label": "人工播放检查",
+      "sublabel": "节奏与声音通过后再发布",
+      "pos": [1610, 80],
+      "size": [170, 68]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "一键发本机离线边界",
+      "wraps": ["montage_ui", "batch_service", "speech_adapter", "macos_voice", "windows_voice", "audio_normalizer", "duration_probe", "clip_planner", "video_renderer", "batch_receipt", "failure_receipt"]
+    }
+  ],
+  "connections": [
+    {
+      "id": "ui_to_batch",
+      "from": "montage_ui",
+      "to": "batch_service",
+      "label": "文字与混剪设置",
+      "variant": "emphasis",
+      "labelDy": -30
+    },
+    {
+      "id": "batch_to_speech",
+      "from": "batch_service",
+      "to": "speech_adapter",
+      "label": "整批只合成一次",
+      "labelDy": -30
+    },
+    {
+      "id": "speech_to_macos",
+      "from": "speech_adapter",
+      "to": "macos_voice",
+      "label": "Mac 生成 AIFF",
+      "labelDx": 58
+    },
+    {
+      "id": "speech_to_windows",
+      "from": "speech_adapter",
+      "to": "windows_voice",
+      "label": "Windows 生成 WAV",
+      "labelAt": [675, 400]
+    },
+    {
+      "id": "speech_to_normalizer",
+      "from": "speech_adapter",
+      "to": "audio_normalizer",
+      "label": "本机原始音频",
+      "labelDy": -30
+    },
+    {
+      "id": "normalizer_to_probe",
+      "from": "audio_normalizer",
+      "to": "duration_probe",
+      "label": "统一配音文件",
+      "labelDy": -30
+    },
+    {
+      "id": "probe_to_planner",
+      "from": "duration_probe",
+      "to": "clip_planner",
+      "label": "最终成片时长",
+      "labelDy": -30
+    },
+    {
+      "id": "planner_to_renderer",
+      "from": "clip_planner",
+      "to": "video_renderer",
+      "label": "镜头计划与配音引用",
+      "labelDy": -30
+    },
+    {
+      "id": "renderer_to_receipt",
+      "from": "video_renderer",
+      "to": "batch_receipt",
+      "label": "音轨与文件回读",
+      "labelDx": 68
+    },
+    {
+      "id": "receipt_to_review",
+      "from": "batch_receipt",
+      "to": "human_review",
+      "label": "本地成片",
+      "labelDy": -30
+    },
+    {
+      "id": "batch_to_failure",
+      "from": "batch_service",
+      "to": "failure_receipt",
+      "label": "任一阶段失败写终态",
+      "variant": "security",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "straight",
+      "labelAt": [425, 400]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "核心合同",
+      "items": [
+        "配音只合成一次，整批成片引用同一音频哈希",
+        "配音时长决定视频时长，不截断解说，不强制变速",
+        "配音模式不混入素材原声"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "本机与隐私",
+      "items": [
+        "只调用系统已安装中文声音",
+        "文案和音频不上传云端",
+        "Mac 与 Windows 音色可以不同，同一批内必须一致"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "当前状态",
+      "items": [
+        "本图是已批准设计，不代表功能已经实现",
+        "没有中文声音时明确失败，不回退为英文",
+        "本地成功仍需人工播放确认"
+      ]
+    }
+  ]
+}
