@@ -94,6 +94,27 @@ class AutomaticMontagePageTests(unittest.TestCase):
         page.clear_source_selection()
         self.assertEqual(page.selected_source_paths(), [])
 
+    def test_select_all_limits_selection_to_fifty_sources(self) -> None:
+        self.rows = []
+        for index in range(51):
+            video = self.root / f"source-{index:02d}.mp4"
+            video.write_bytes(str(index).encode())
+            self.rows.append(
+                {
+                    "filename": video.name,
+                    "storedPath": str(video),
+                    "typeText": "视频",
+                    "mediaCategory": "批量测试",
+                }
+            )
+
+        page = self.page()
+        page.select_all_sources()
+
+        self.assertEqual(page.source_list.count(), 51)
+        self.assertEqual(len(page.selected_source_paths()), 50)
+        self.assertEqual(page.source_count.text(), "已选择 50 / 51")
+
     def test_build_request_uses_visible_controls(self) -> None:
         page = self.page()
         page.source_list.item(0).setCheckState(Qt.CheckState.Checked)

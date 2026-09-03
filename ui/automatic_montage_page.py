@@ -341,7 +341,8 @@ class AutomaticMontagePage(QWidget):
     def select_all_sources(self) -> None:
         self.source_list.blockSignals(True)
         for index in range(self.source_list.count()):
-            self.source_list.item(index).setCheckState(Qt.CheckState.Checked)
+            state = Qt.CheckState.Checked if index < 50 else Qt.CheckState.Unchecked
+            self.source_list.item(index).setCheckState(state)
         self.source_list.blockSignals(False)
         self._on_source_selection_changed()
 
