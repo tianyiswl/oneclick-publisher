@@ -81,6 +81,7 @@ class AutomaticMontagePage(QWidget):
         self.runner = task_runner or BackgroundTaskRunner(self)
         self._local_paths: list[Path] = []
         self._last_batch_dir: Path | None = None
+        self._progress_output_count: int | None = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 20, 24, 20)
@@ -431,6 +432,7 @@ class AutomaticMontagePage(QWidget):
     def _on_started(self) -> None:
         self.start_button.setEnabled(False)
         self.refresh_button.setEnabled(False)
+        self._progress_output_count = None
         self.progress_bar.setValue(1)
         self.status_label.setStyleSheet("")
         self.status_label.setText("正在读取素材…")
@@ -452,16 +454,23 @@ class AutomaticMontagePage(QWidget):
             self.progress_bar.setValue(22)
             self.status_label.setText(f"配音已生成，成片时长 {duration:g} 秒；正在安排镜头…")
         elif stage == "planning":
+            self._progress_output_count = max(1, int(event.get("output_count") or 1))
             self.progress_bar.setValue(24)
             self.status_label.setText("正在安排不重复镜头…")
         elif stage == "rendering":
             current = int(event.get("output_index") or 1)
-            total = max(1, int(event.get("output_count") or 1))
-            self.progress_bar.setValue(25 + round((current - 1) / total * 65))
-            self.status_label.setText(f"正在生成第 {current}/{total} 条视频…")
+            if event.get("output_count") is not None:
+                self._progress_output_count = max(1, int(event["output_count"] or 1))
+            if self._progress_output_count is not None:
+                total = self._progress_output_count
+                self.progress_bar.setValue(25 + round((current - 1) / total * 65))
+                self.status_label.setText(f"正在生成第 {current}/{total} 条视频…")
+            else:
+                self.status_label.setText(f"正在生成第 {current} 条视频…")
         elif stage == "output_completed":
             current = int(event.get("output_index") or 1)
-            total = max(1, int(event.get("output_count") or 1))
+            self._progress_output_count = max(1, int(event.get("output_count") or 1))
+            total = self._progress_output_count
             self.progress_bar.setValue(25 + round(current / total * 65))
         elif stage == "completed":
             self.progress_bar.setValue(100)

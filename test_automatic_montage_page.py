@@ -228,6 +228,21 @@ class AutomaticMontagePageTests(unittest.TestCase):
 
         self.assertEqual(progress_values, sorted(progress_values))
 
+    def test_rendering_without_output_count_keeps_batch_progress_monotonic(self) -> None:
+        page = self.page()
+        progress_values = []
+        page._on_progress({"stage": "planning", "output_count": 5})
+        progress_values.append(page.progress_bar.value())
+        for output_index in range(1, 6):
+            page._on_progress({"stage": "rendering", "output_index": output_index})
+            progress_values.append(page.progress_bar.value())
+            page._on_progress(
+                {"stage": "output_completed", "output_index": output_index, "output_count": 5}
+            )
+            progress_values.append(page.progress_bar.value())
+
+        self.assertEqual(progress_values, sorted(progress_values))
+
     def test_generation_runs_in_runner_and_populates_result_table(self) -> None:
         runner = _ImmediateRunner()
         batch_dir = self.root / "batch"
