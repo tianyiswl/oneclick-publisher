@@ -2,7 +2,7 @@
 
 日期：2026-09-03
 
-状态：纯净源码快照与隔离 Mac 中性素材批次机器验收通过；公众号已授权定时入口导航已回归；客户端与 QuickTime 听审停点已关闭，人工听感仍待大帅以后确认；Windows 仍只有适配器合同测试。
+状态：纯净源码快照与隔离 Mac 中性素材批次机器验收通过；公众号已授权定时入口导航已回归；源码客户端与 QuickTime 隔离成片听审停点已恢复为 `00:00` / 播放 `off`，人工听感待大帅确认；Windows 仍只有适配器合同测试。
 
 > 审计说明：本报告前半部分保留初始轮次的原始记录以便追溯，但其中混合工作树上的 `77/77`、`3175/3175`、`NATIVE_DESKTOP_UI_OK`、源码启动，以及写入正式用户数据目录并混用两个内容来源的批次 `M0903160612-1765F3`，均已撤销为验收证据。当前实现与回归结论以文末“Fix round 2”的纯净提交为准；Mac 隔离真实批次、Archify 和旧批次保留边界继续以“Fix round 1”为准。旧正式目录批次没有删除、覆盖或改写。
 
@@ -189,3 +189,28 @@ YIJIANFA_USER_DATA_DIR='<fix-evidence>/ui-test-head-606925f' \
 - 本轮没有播放音频，不宣称人工听感通过。Fix round 1 的隔离 Mac 机器回读仍有效，但人工听感仍待大帅以后另行听审。
 - 未改版本、未打包、未安装替换、未推送，未创建发布任务，未操作任何平台或账号。Windows 仍只有合同级单测，没有 Windows 真机验收。
 - 原工作树中的账号/Meta 改动、自动视频生产产物和其他无关脏改动继续原样保留，本轮不归因、不纳入。
+
+## Fix round 3：恢复纯净隔离人工试听停点
+
+### 跨轮状态纠正
+
+Fix round 2 关闭了源码客户端与 QuickTime，但 `SOURCE_OF_TRUTH.md` 仍写“当前已在 `00:00`”，当时状态冲突。Fix round 3 已恢复这个停点：权威状态与当前运行事实现在重新一致。
+
+### 纯净源码和隔离目录证据
+
+- 当前产品提交 `d0b9011f73f26d247a3a90c73a21348a2a2dce4f` 与 detached 纯净快照 `f86ce818cf3f9512999ae32565f28465be8579e5` 的 `desktop_native_app.py`、`ui/main_window.py`、自动混剪页及 4 个核心混剪/配音模块，共 7 个源码 blob 逐一相同。纯净快照 `git status --porcelain` 为空。
+- 启动路径为 `/private/tmp/oneclick-task7-fix1-663b68e/desktop_native_app.py`，进程 PID `86617`；`lsof` 回读 `cwd=/private/tmp/oneclick-task7-fix1-663b68e`。
+- 该进程只打开 `fix-round-1-evidence/runtime-user-data/` 下的本地日志与隔离数据，未使用正式 `/Users/andy/Library/Application Support/一键发`主数据目录。源码窗口回读为“源码联调”且当前页为“自动混剪”，只显示 2 条“一键发中性验收”素材。
+
+### QuickTime 成片与停点证据
+
+- 精确成片：`/Users/andy/Documents/Codex/2026-07-28/new-chat/outputs/一键发桌面UI基座/.worktrees/integration-oneclick-0.5.30-stable/.superpowers/sdd/2026-09-03-oneclick-automatic-montage-system-narration/fix-round-1-evidence/runtime-user-data/automatic-montage/M0903163951-A0F528/001/video.mp4`。
+- 文件大小 `946257` 字节，SHA-256 `4665d288fd2caae1635fe5bd2355cb3ad22e13aa5a974412a7f27b44c4d351ee`，与 Fix round 1 回执一致。
+- QuickTime 窗口 URL 只读回读为上述精确文件；最终控件状态为“播放/暂停 `off`”、“经过时间 `00:00`”、“时间线 `0`”、总时长 `00:07`。该停点当前未在播放。
+- 操作审计：首次打开后的两次画面对比显示 QuickTime 曾处于播放；鞋匠发现后将其暂停并精确复位到时间线 `0`，随后二次回读 `off` / `00:00`。因此可证明当前停点没有播放，但不宣称打开过程中从未出现短暂播放。
+- 鞋匠未对音色、语速、末句完整性或是否串入素材原声做人工听感结论。大帅现在只需在 QuickTime 窗口点击播放并听完首条。
+
+### 本轮边界
+
+- 本轮没有跑全量、没有重新生成批次；只做源码 blob、进程、打开文件和播放停点的只读核验。
+- 未改版本、未打包、未安装替换、未推送，未创建或操作任何平台任务或账号。人工听感和 Windows 真机仍未验证。
