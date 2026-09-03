@@ -186,6 +186,15 @@ class AutomaticMontagePageTests(unittest.TestCase):
         self.assertEqual(page.narration_text.toPlainText(), "  同一条解说  ")
         self.assertTrue(page.narration_panel.isHidden())
 
+    def test_narration_mode_explains_readback_duration_rule(self) -> None:
+        page = self.page()
+        page.audio_mode.setCurrentIndex(page.audio_mode.findData("narration"))
+
+        self.assertEqual(
+            page.target_duration_follow_label.text(),
+            "读回语音 + 300ms（5–180 秒）",
+        )
+
     def test_narration_progress_and_success_show_voice_and_duration(self) -> None:
         page = self.page()
         page._on_progress({"stage": "narration_synthesizing"})
@@ -200,6 +209,24 @@ class AutomaticMontagePageTests(unittest.TestCase):
         )
         page._on_success(result)
         self.assertIn("Test Chinese", page.status_label.text())
+        self.assertIn("主音轨 5.3 秒", page.status_label.text())
+
+    def test_narration_progress_never_regresses(self) -> None:
+        page = self.page()
+        progress_values = []
+        for event in (
+            {"stage": "probing", "current": 1, "total": 1},
+            {"stage": "narration_synthesizing"},
+            {"stage": "narration_readback", "master_duration_ms": 5300},
+            {"stage": "planning", "output_count": 1},
+            {"stage": "rendering", "output_index": 1, "output_count": 1},
+            {"stage": "output_completed", "output_index": 1, "output_count": 1},
+            {"stage": "completed"},
+        ):
+            page._on_progress(event)
+            progress_values.append(page.progress_bar.value())
+
+        self.assertEqual(progress_values, sorted(progress_values))
 
     def test_generation_runs_in_runner_and_populates_result_table(self) -> None:
         runner = _ImmediateRunner()

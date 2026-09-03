@@ -181,7 +181,7 @@ class AutomaticMontagePage(QWidget):
         self.target_duration.setValue(30)
         self.target_duration.setSuffix(" 秒")
         self.target_duration_label = QLabel("每条总时长")
-        self.target_duration_follow_label = QLabel("跟随配音")
+        self.target_duration_follow_label = QLabel("读回语音 + 300ms（5–180 秒）")
         self.target_duration_follow_label.setProperty("role", "caption")
         grid.addWidget(self.target_duration_label, 1, 0)
         grid.addWidget(self.target_duration, 1, 1)
@@ -452,17 +452,17 @@ class AutomaticMontagePage(QWidget):
             self.progress_bar.setValue(22)
             self.status_label.setText(f"配音已生成，成片时长 {duration:g} 秒；正在安排镜头…")
         elif stage == "planning":
-            self.progress_bar.setValue(18)
+            self.progress_bar.setValue(24)
             self.status_label.setText("正在安排不重复镜头…")
         elif stage == "rendering":
             current = int(event.get("output_index") or 1)
             total = max(1, int(event.get("output_count") or 1))
-            self.progress_bar.setValue(20 + round((current - 1) / total * 70))
+            self.progress_bar.setValue(25 + round((current - 1) / total * 65))
             self.status_label.setText(f"正在生成第 {current}/{total} 条视频…")
         elif stage == "output_completed":
             current = int(event.get("output_index") or 1)
             total = max(1, int(event.get("output_count") or 1))
-            self.progress_bar.setValue(20 + round(current / total * 70))
+            self.progress_bar.setValue(25 + round(current / total * 65))
         elif stage == "completed":
             self.progress_bar.setValue(100)
 
