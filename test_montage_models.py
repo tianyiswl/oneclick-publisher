@@ -61,6 +61,20 @@ class MontageModelsTests(unittest.TestCase):
         request = self.request(audio_mode="mute", narration_text="不会参与生成")
         self.assertEqual(request.narration_text, "")
 
+    def test_non_narration_mode_ignores_non_text_narration_value(self) -> None:
+        for audio_mode, extra in (
+            ("mute", {}),
+            ("source", {"source_audio_confirmed": True}),
+        ):
+            with self.subTest(audio_mode=audio_mode):
+                request = self.request(
+                    audio_mode=audio_mode,
+                    narration_text={"stale": "value"},
+                    **extra,
+                )
+                self.assertEqual(request.narration_text, "")
+                self.assertEqual(request.to_dict()["narration_text"], "")
+
     def test_narration_mode_does_not_compare_clip_with_ignored_ui_target(self) -> None:
         request = self.request(
             audio_mode="narration",

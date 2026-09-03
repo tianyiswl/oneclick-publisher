@@ -144,14 +144,14 @@ class MontageRequest:
                 "音频模式只能是静音、保留环境原声或系统自动配音",
             )
 
-        narration_value = raw.get("narration_text", "")
-        if not isinstance(narration_value, str):
-            raise MontageFailure("montage_narration_text_required", "配音文案必须是文字")
-        narration_text = narration_value.strip()
-        if audio_mode == "narration" and not narration_text:
-            raise MontageFailure("montage_narration_text_required", "请输入需要配音的解说文案")
-        if audio_mode != "narration":
-            narration_text = ""
+        narration_text = ""
+        if audio_mode == "narration":
+            narration_value = raw.get("narration_text", "")
+            if not isinstance(narration_value, str):
+                raise MontageFailure("montage_narration_text_required", "配音文案必须是文字")
+            narration_text = narration_value.strip()
+            if not narration_text:
+                raise MontageFailure("montage_narration_text_required", "请输入需要配音的解说文案")
 
         if audio_mode != "narration" and clip_duration_ms > target_duration_ms:
             raise MontageFailure(
