@@ -949,8 +949,8 @@ class AccountDetectionUiTests(unittest.TestCase):
         window.set_current_page_by_key("publish")
         self.app.processEvents()
         self.assertIs(window.tabs.currentWidget(), window.publish)
-        self.assertEqual(window.tabs.currentIndex(), 3)
-        self.assertTrue(window.nav_buttons[3].isChecked())
+        self.assertEqual(window.tabs.currentIndex(), 4)
+        self.assertTrue(window.nav_buttons[4].isChecked())
         self.assertEqual(window.current_workspace_label.text(), "发布中心")
         window.close()
 
@@ -958,7 +958,10 @@ class AccountDetectionUiTests(unittest.TestCase):
         window = MainWindow()
         try:
             labels = [label for label, _page, _icon in window.page_definitions]
-            self.assertEqual(labels[3:6], ["发布中心", "抖音图文矩阵", "抖音带货"])
+            self.assertEqual(
+                labels[3:7],
+                ["自动混剪", "发布中心", "抖音图文矩阵", "抖音带货"],
+            )
             window.set_current_page_by_key("douyin_graphic_matrix")
             self.assertIs(window.tabs.currentWidget(), window.douyin_graphic_matrix)
             self.assertEqual(window.current_workspace_label.text(), "抖音图文矩阵")

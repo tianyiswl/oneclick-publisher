@@ -106,7 +106,16 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--page",
-        choices=("workspace", "accounts", "media", "publish", "commerce", "tasks", "data"),
+        choices=(
+            "workspace",
+            "accounts",
+            "media",
+            "montage",
+            "publish",
+            "commerce",
+            "tasks",
+            "data",
+        ),
         default="commerce",
     )
     args = parser.parse_args()

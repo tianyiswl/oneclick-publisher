@@ -34,7 +34,7 @@ from PyQt6.QtWidgets import (
 from app_core import account_browser_service, activation_service
 from app_core.branding import APP_ICON_RELATIVE_PATH, APP_TITLE, APP_VERSION, UPGRADE_STORE
 from app_core.source_live_runtime import source_live_data_active
-from app_core.paths import AVATAR_DIR, COOKIE_DIR, DB_PATH, LOG_DIR, ROOT_DIR, VIDEO_DIR
+from app_core.paths import AVATAR_DIR, COOKIE_DIR, DB_PATH, LOG_DIR, MONTAGE_DIR, ROOT_DIR, VIDEO_DIR
 
 from .background_task import BackgroundTaskRunner
 from .common import button
@@ -43,6 +43,7 @@ from .dashboard_page import DashboardPage
 from .data_monitor_page import DataMonitorPage
 from .douyin_commerce_page import DouyinCommercePage
 from .douyin_graphic_matrix_page import DouyinGraphicMatrixPage
+from .automatic_montage_page import AutomaticMontagePage
 from .help_dialog import HelpDialog
 from .media_page import MediaPage
 from .publish_page import PublishPage
@@ -353,6 +354,7 @@ class MainWindow(QMainWindow):
         self.dashboard = DashboardPage()
         self.accounts = AccountPage()
         self.media = MediaPage()
+        self.automatic_montage = AutomaticMontagePage()
         self.publish = PublishPage()
         self.douyin_graphic_matrix = DouyinGraphicMatrixPage()
         self.douyin_graphic_matrix.request_account_management.connect(
@@ -378,6 +380,7 @@ class MainWindow(QMainWindow):
             ("工作台", self.dashboard, "ui/assets/nav-dashboard.svg"),
             ("账号管理", self.accounts, "ui/assets/nav-accounts.svg"),
             ("素材管理", self.media, "ui/assets/nav-media.svg"),
+            ("自动混剪", self.automatic_montage, "ui/assets/nav-media.svg"),
             ("发布中心", self.publish, "ui/assets/nav-publish.svg"),
             ("抖音图文矩阵", self.douyin_graphic_matrix, "ui/assets/nav-publish.svg"),
             ("抖音带货", self.douyin_commerce, "ui/assets/nav-publish.svg"),
@@ -641,6 +644,7 @@ class MainWindow(QMainWindow):
         menu = QMenu(parent)
         for title, path in (
             ("打开素材目录", VIDEO_DIR),
+            ("打开混剪输出目录", MONTAGE_DIR),
             ("打开账号登录目录", COOKIE_DIR),
             ("打开头像目录", AVATAR_DIR),
             ("打开日志目录", LOG_DIR),
@@ -678,11 +682,12 @@ class MainWindow(QMainWindow):
             "workspace": 0,
             "accounts": 1,
             "media": 2,
-            "publish": 3,
-            "douyin_graphic_matrix": 4,
-            "commerce": 5,
-            "tasks": 6,
-            "data": 7,
+            "montage": 3,
+            "publish": 4,
+            "douyin_graphic_matrix": 5,
+            "commerce": 6,
+            "tasks": 7,
+            "data": 8,
         }
         try:
             index = page_indexes[str(page_key)]
@@ -705,6 +710,9 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event) -> None:
+        if self.automatic_montage.shutdown() is not True:
+            event.ignore()
+            return
         if self.douyin_commerce.shutdown() is not True:
             event.ignore()
             return

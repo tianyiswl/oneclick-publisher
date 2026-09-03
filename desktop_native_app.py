@@ -601,7 +601,15 @@ def main() -> int:
     parser.add_argument("--browser-self-test", action="store_true")
     parser.add_argument(
         "--page",
-        choices=("workspace", "accounts", "media", "publish", "commerce", "tasks"),
+        choices=(
+            "workspace",
+            "accounts",
+            "media",
+            "montage",
+            "publish",
+            "commerce",
+            "tasks",
+        ),
         help="启动时直接打开指定工作页，便于本地验收。",
     )
     parser.add_argument("--verify-release", metavar="ZIP")

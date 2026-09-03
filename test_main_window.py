@@ -152,6 +152,37 @@ class MainWindowShutdownTests(unittest.TestCase):
         stop_auto.assert_not_called()
         close_all.assert_not_called()
 
+    def test_automatic_montage_is_real_page_and_blocks_close_before_other_cleanup(self) -> None:
+        """本地编码仍在运行时必须先阻止退出，不能继续关闭平台会话。"""
+
+        window = MainWindow()
+        event = QCloseEvent()
+        order: list[str] = []
+        try:
+            labels = [label for label, _page, _icon in window.page_definitions]
+            self.assertIn("自动混剪", labels)
+            window.set_current_page_by_key("montage")
+            self.assertEqual(window.current_workspace_label.text(), "自动混剪")
+            with patch.object(
+                window.automatic_montage,
+                "shutdown",
+                side_effect=lambda: order.append("montage") or False,
+            ), patch.object(
+                window.douyin_commerce,
+                "shutdown",
+                side_effect=lambda: order.append("commerce") or True,
+            ), patch.object(
+                window.accounts,
+                "stop_auto_checking",
+                side_effect=lambda: order.append("accounts"),
+            ):
+                window.closeEvent(event)
+        finally:
+            window.deleteLater()
+
+        self.assertFalse(event.isAccepted())
+        self.assertEqual(order, ["montage"])
+
 
 if __name__ == "__main__":
     unittest.main()
