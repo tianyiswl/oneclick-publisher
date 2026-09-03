@@ -1,0 +1,18 @@
+{
+  "allow_reuse": false,
+  "audio_mode": "narration",
+  "batch_id": "M0903163951-A0F528",
+  "body_template": "",
+  "clip_duration_ms": 2000,
+  "created_at": "2026-09-03T16:39:51+08:00",
+  "output_count": 3,
+  "schema_version": "oneclick-montage-request/v2",
+  "seed": 20260903,
+  "source_audio_confirmed": false,
+  "source_paths": [
+    "/Users/andy/Documents/Codex/2026-07-28/new-chat/outputs/一键发桌面UI基座/.worktrees/integration-oneclick-0.5.30-stable/.superpowers/sdd/2026-09-03-oneclick-automatic-montage-system-narration/fix-round-1-evidence/runtime-user-data/videoFile/92d88ac0-a772-11f1-960a-16d46793b38b_oneclick-neutral-b.mp4",
+    "/Users/andy/Documents/Codex/2026-07-28/new-chat/outputs/一键发桌面UI基座/.worktrees/integration-oneclick-0.5.30-stable/.superpowers/sdd/2026-09-03-oneclick-automatic-montage-system-narration/fix-round-1-evidence/runtime-user-data/videoFile/92cc5fac-a772-11f1-960a-16d46793b38b_oneclick-neutral-a.mp4"
+  ],
+  "target_duration_ms": 30000,
+  "title_template": ""
+}

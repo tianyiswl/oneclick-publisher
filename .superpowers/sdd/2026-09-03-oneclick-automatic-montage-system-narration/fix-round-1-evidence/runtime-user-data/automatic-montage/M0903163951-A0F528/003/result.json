@@ -1,0 +1,17 @@
+{
+  "audio_mode": "narration",
+  "audio_stream_sha256": "6f8bba7d196a00e4e0cdbe764707cd1598293d39694a40b8101d0c71d8cfe9b0",
+  "body": "",
+  "duration_ms": 7509,
+  "expected_duration_ms": 7509,
+  "fingerprint": "cc855d7a9a7f6335f9b887c0448036aa9c9ab8d824aeef29b2f6bdc95766cae9",
+  "height": 1920,
+  "index": 3,
+  "narration_sha256": "8ccf56dc517f05462d97853f27bc3fa79430e8d41f4ef2d7ae9e9234cd0187f8",
+  "narration_stream_sha256": "6f8bba7d196a00e4e0cdbe764707cd1598293d39694a40b8101d0c71d8cfe9b0",
+  "output_path": "/Users/andy/Documents/Codex/2026-07-28/new-chat/outputs/一键发桌面UI基座/.worktrees/integration-oneclick-0.5.30-stable/.superpowers/sdd/2026-09-03-oneclick-automatic-montage-system-narration/fix-round-1-evidence/runtime-user-data/automatic-montage/M0903163951-A0F528/003/video.mp4",
+  "sha256": "d4e524a8bd7a250a61bb0849847b51d48b2f2baa86a4156911f40065894b974b",
+  "status": "success",
+  "title": "",
+  "width": 1080
+}

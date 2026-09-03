@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "command": "deliver",
+  "type": "lifecycle",
+  "input": "/private/tmp/oneclick-task7-fix1-663b68e/docs/architecture/automatic-montage-system-narration.lifecycle.json",
+  "output": "/private/tmp/oneclick-task7-fix1-663b68e/docs/architecture/automatic-montage-system-narration.lifecycle.html",
+  "specification": {
+    "sha256": "ecaa280983e8be332cba685fe048720102ebe1fad005c4416e80ba448d01abe2",
+    "bytes": 6733
+  },
+  "artifact": {
+    "sha256": "02216b1161d58b51d2d505ece5260d06b433f0715da8f2eedaa61cdc81db5434",
+    "bytes": 641282
+  },
+  "validation": {
+    "checksPassed": 9,
+    "checkCount": 9,
+    "compositionProfile": "showcase",
+    "compositionStatus": "pass",
+    "errors": 0,
+    "warnings": 0
+  }
+}

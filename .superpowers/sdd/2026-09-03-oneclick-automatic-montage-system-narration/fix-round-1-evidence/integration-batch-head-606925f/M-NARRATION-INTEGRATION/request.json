@@ -1,0 +1,18 @@
+{
+  "allow_reuse": false,
+  "audio_mode": "narration",
+  "batch_id": "M-NARRATION-INTEGRATION",
+  "body_template": "",
+  "clip_duration_ms": 1000,
+  "created_at": "2026-09-03T16:50:52+08:00",
+  "output_count": 3,
+  "schema_version": "oneclick-montage-request/v2",
+  "seed": 20260903,
+  "source_audio_confirmed": false,
+  "source_paths": [
+    "/private/var/folders/nf/651x5lyx4w507026q0psw2yr0000gn/T/tmpq2d_o0or/red-440hz.mp4",
+    "/private/var/folders/nf/651x5lyx4w507026q0psw2yr0000gn/T/tmpq2d_o0or/blue-880hz.mp4"
+  ],
+  "target_duration_ms": 5000,
+  "title_template": ""
+}

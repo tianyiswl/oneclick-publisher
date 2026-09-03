@@ -1,0 +1,79 @@
+{
+  "batch_id": "M-NARRATION-INTEGRATION",
+  "effective_target_duration_ms": 8938,
+  "finished_at": "2026-09-03T16:50:56+08:00",
+  "narration": {
+    "channels": 2,
+    "codec_name": "aac",
+    "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+    "master_duration_ms": 8938,
+    "master_path": "/Users/andy/Documents/Codex/2026-07-28/new-chat/outputs/一键发桌面UI基座/.worktrees/integration-oneclick-0.5.30-stable/.superpowers/sdd/2026-09-03-oneclick-automatic-montage-system-narration/fix-round-1-evidence/integration-batch-head-606925f/M-NARRATION-INTEGRATION/narration/master.m4a",
+    "sample_rate": 48000,
+    "sha256": "cc620750956d539724379cd532abf932773e5d20cd5a5cdbd9c2d8746f3eaec9",
+    "speech_duration_ms": 8638,
+    "status": "success",
+    "stream_sha256": "44d855f9f8e9506d06583dda2e9855006ad592060b750ee5cac242ff0c5344c2",
+    "voice_id": "Eddy (中文（中国大陆）)",
+    "voice_locale": "zh-CN"
+  },
+  "outputs": [
+    {
+      "audio_mode": "narration",
+      "audio_stream_sha256": "44d855f9f8e9506d06583dda2e9855006ad592060b750ee5cac242ff0c5344c2",
+      "body": "",
+      "duration_ms": 8938,
+      "expected_duration_ms": 8938,
+      "fingerprint": "6c4aa5bac0a52dbeca0667a1d802555b7e368e86b6e1e22cf6b59a04f1819a91",
+      "height": 1920,
+      "index": 1,
+      "narration_sha256": "cc620750956d539724379cd532abf932773e5d20cd5a5cdbd9c2d8746f3eaec9",
+      "narration_stream_sha256": "44d855f9f8e9506d06583dda2e9855006ad592060b750ee5cac242ff0c5344c2",
+      "output_path": "/Users/andy/Documents/Codex/2026-07-28/new-chat/outputs/一键发桌面UI基座/.worktrees/integration-oneclick-0.5.30-stable/.superpowers/sdd/2026-09-03-oneclick-automatic-montage-system-narration/fix-round-1-evidence/integration-batch-head-606925f/M-NARRATION-INTEGRATION/001/video.mp4",
+      "sha256": "87dea59f09c7c9f72ebceb89680a0b9f19410886d5cd7c19185dab70707de62f",
+      "status": "success",
+      "title": "",
+      "width": 1080
+    },
+    {
+      "audio_mode": "narration",
+      "audio_stream_sha256": "44d855f9f8e9506d06583dda2e9855006ad592060b750ee5cac242ff0c5344c2",
+      "body": "",
+      "duration_ms": 8938,
+      "expected_duration_ms": 8938,
+      "fingerprint": "a100e06774763cbb68c94f3ca3301a4abee1b4771e2100c06d86aaf909a404f2",
+      "height": 1920,
+      "index": 2,
+      "narration_sha256": "cc620750956d539724379cd532abf932773e5d20cd5a5cdbd9c2d8746f3eaec9",
+      "narration_stream_sha256": "44d855f9f8e9506d06583dda2e9855006ad592060b750ee5cac242ff0c5344c2",
+      "output_path": "/Users/andy/Documents/Codex/2026-07-28/new-chat/outputs/一键发桌面UI基座/.worktrees/integration-oneclick-0.5.30-stable/.superpowers/sdd/2026-09-03-oneclick-automatic-montage-system-narration/fix-round-1-evidence/integration-batch-head-606925f/M-NARRATION-INTEGRATION/002/video.mp4",
+      "sha256": "e96dfe234364468c809ce86acbd2a433c7fe36726b05b3fc9c86fe1f12633f55",
+      "status": "success",
+      "title": "",
+      "width": 1080
+    },
+    {
+      "audio_mode": "narration",
+      "audio_stream_sha256": "44d855f9f8e9506d06583dda2e9855006ad592060b750ee5cac242ff0c5344c2",
+      "body": "",
+      "duration_ms": 8938,
+      "expected_duration_ms": 8938,
+      "fingerprint": "cdbde44b9f9ad1c4ef8483044e0bc2edf9b7313bb3f4b298813894f9979330af",
+      "height": 1920,
+      "index": 3,
+      "narration_sha256": "cc620750956d539724379cd532abf932773e5d20cd5a5cdbd9c2d8746f3eaec9",
+      "narration_stream_sha256": "44d855f9f8e9506d06583dda2e9855006ad592060b750ee5cac242ff0c5344c2",
+      "output_path": "/Users/andy/Documents/Codex/2026-07-28/new-chat/outputs/一键发桌面UI基座/.worktrees/integration-oneclick-0.5.30-stable/.superpowers/sdd/2026-09-03-oneclick-automatic-montage-system-narration/fix-round-1-evidence/integration-batch-head-606925f/M-NARRATION-INTEGRATION/003/video.mp4",
+      "sha256": "f5f2ce1a45a5e1ec64225184d566b8f09df34ad4384c3af5a93d41789f25560b",
+      "status": "success",
+      "title": "",
+      "width": 1080
+    }
+  ],
+  "schema_version": "oneclick-montage-batch-receipt/v2",
+  "started_at": "2026-09-03T16:50:52+08:00",
+  "status": "success",
+  "summary": {
+    "failed": 0,
+    "success": 3
+  }
+}
