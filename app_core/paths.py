@@ -25,6 +25,7 @@ COOKIE_DIR = USER_DATA_DIR / "cookiesFile"
 AVATAR_DIR = USER_DATA_DIR / "avatars"
 LOG_DIR = USER_DATA_DIR / "logs"
 COVER_DIR = AVATAR_DIR / "media_covers"
+MONTAGE_DIR = USER_DATA_DIR / "automatic-montage"
 TIKTOK_COOKIE_DIR = USER_DATA_DIR / "cookies"
 LEGACY_ACTIVATION_FILE = LEGACY_RUNTIME_ROOT / "db" / "activation.json"
 ACTIVATION_FILE = USER_DATA_DIR / "license-state.json"
@@ -72,6 +73,7 @@ def ensure_runtime_dirs() -> None:
         AVATAR_DIR,
         LOG_DIR,
         COVER_DIR,
+        MONTAGE_DIR,
         USER_DATA_DIR,
     ):
         path.mkdir(parents=True, exist_ok=True)
