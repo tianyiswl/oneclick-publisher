@@ -63,6 +63,10 @@ class SystemVoice:
 class AudioReadback:
     duration_ms: int
     stream_sha256: str
+    codec_name: str
+    sample_rate: int
+    channels: int
+    format_name: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +78,10 @@ class NarrationArtifact:
     master_duration_ms: int
     sha256: str
     stream_sha256: str
+    codec_name: str
+    sample_rate: int
+    channels: int
+    format_name: str
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -85,6 +93,10 @@ class NarrationArtifact:
             "master_duration_ms": self.master_duration_ms,
             "sha256": self.sha256,
             "stream_sha256": self.stream_sha256,
+            "codec_name": self.codec_name,
+            "sample_rate": self.sample_rate,
+            "channels": self.channels,
+            "format_name": self.format_name,
         }
 
 
@@ -231,7 +243,13 @@ def _synthesize_windows_raw(
     runner: Runner = subprocess.run,
 ) -> None:
     script_path = Path(text_path).parent / "system-speech.ps1"
-    script_path.write_text(_WINDOWS_SYNTHESIS_SCRIPT, encoding="utf-8")
+    try:
+        script_path.write_text(_WINDOWS_SYNTHESIS_SCRIPT, encoding="utf-8")
+    except OSError as exc:
+        raise MontageFailure(
+            "montage_narration_synthesis_failed",
+            "Windows 系统配音脚本写入失败",
+        ) from exc
     command = [
         "powershell.exe",
         "-NoProfile",
@@ -255,16 +273,14 @@ def _run_raw_synthesis(
 ) -> None:
     try:
         completed = _invoke(command, runner=runner, timeout=180)
+        output = Path(raw_output_path)
+        output_is_valid = output.is_file() and output.stat().st_size > 0
     except (OSError, subprocess.SubprocessError) as exc:
         raise MontageFailure(
             "montage_narration_synthesis_failed",
             "系统配音生成失败",
         ) from exc
-    if (
-        completed.returncode != 0
-        or not Path(raw_output_path).is_file()
-        or Path(raw_output_path).stat().st_size <= 0
-    ):
+    if completed.returncode != 0 or not output_is_valid:
         raise MontageFailure(
             "montage_narration_synthesis_failed",
             "系统配音生成失败",
@@ -283,7 +299,7 @@ def probe_audio_readback(
         "-v",
         "error",
         "-show_entries",
-        "stream=codec_type,duration:format=duration",
+        "stream=codec_type,codec_name,sample_rate,channels,duration:format=duration,format_name",
         "-of",
         "json",
         str(source),
@@ -310,6 +326,15 @@ def probe_audio_readback(
                 raise ValueError("missing format duration")
             raw_duration = format_data.get("duration")
         duration_ms = round(float(raw_duration) * 1000)
+        codec_name = str(audio_stream.get("codec_name") or "").strip()
+        sample_rate = int(audio_stream.get("sample_rate"))
+        channels = int(audio_stream.get("channels"))
+        format_data = payload.get("format")
+        if not isinstance(format_data, dict):
+            raise ValueError("missing format")
+        format_name = str(format_data.get("format_name") or "").strip()
+        if not codec_name or sample_rate <= 0 or channels <= 0 or not format_name:
+            raise ValueError("invalid audio format")
 
         hash_command = [
             str(runtime.ffmpeg),
@@ -350,7 +375,29 @@ def probe_audio_readback(
     return AudioReadback(
         duration_ms=duration_ms,
         stream_sha256=match.group(1).lower(),
+        codec_name=codec_name,
+        sample_rate=sample_rate,
+        channels=channels,
+        format_name=format_name,
     )
+
+
+def _validate_master_format(readback: AudioReadback) -> None:
+    container_names = {
+        name.strip().casefold()
+        for name in readback.format_name.split(",")
+        if name.strip()
+    }
+    if (
+        readback.codec_name.casefold() != "aac"
+        or readback.sample_rate != 48_000
+        or readback.channels != 2
+        or "m4a" not in container_names
+    ):
+        raise MontageFailure(
+            "montage_narration_audio_readback_failed",
+            "配音主音轨格式回读不一致",
+        )
 
 
 def _sha256_file(path: Path) -> str:
@@ -392,16 +439,13 @@ def _normalize_master(
     ]
     try:
         completed = _invoke(normalize_command, runner=runner, timeout=180)
+        output_is_valid = staged_master.is_file() and staged_master.stat().st_size > 0
     except (OSError, subprocess.SubprocessError) as exc:
         raise MontageFailure(
             "montage_narration_synthesis_failed",
             "配音主音轨生成失败",
         ) from exc
-    if (
-        completed.returncode != 0
-        or not staged_master.is_file()
-        or staged_master.stat().st_size <= 0
-    ):
+    if completed.returncode != 0 or not output_is_valid:
         raise MontageFailure(
             "montage_narration_synthesis_failed",
             "配音主音轨生成失败",
@@ -424,62 +468,89 @@ def synthesize_system_narration(
         )
 
     target_dir = Path(output_dir).expanduser().resolve()
-    target_dir.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".narration-", dir=target_dir.parent) as temp_name:
-        temp_dir = Path(temp_name)
-        text_path = temp_dir / "narration.txt"
-        text_path.write_text(narration_text, encoding="utf-8")
+    created_target_dir = False
+    try:
+        target_dir.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix=".narration-",
+            dir=target_dir.parent,
+            ignore_cleanup_errors=True,
+        ) as temp_name:
+            temp_dir = Path(temp_name)
+            text_path = temp_dir / "narration.txt"
+            text_path.write_text(narration_text, encoding="utf-8")
 
-        if platform_value == "darwin":
-            voice = choose_chinese_voice(_list_macos_voices(runner=runner))
-            raw_path = temp_dir / "raw.aiff"
-            _synthesize_macos_raw(text_path, raw_path, voice, runner=runner)
-        else:
-            voice = choose_chinese_voice(_list_windows_voices(runner=runner))
-            raw_path = temp_dir / "raw.wav"
-            _synthesize_windows_raw(text_path, raw_path, voice, runner=runner)
+            if platform_value == "darwin":
+                voice = choose_chinese_voice(_list_macos_voices(runner=runner))
+                raw_path = temp_dir / "raw.aiff"
+                _synthesize_macos_raw(text_path, raw_path, voice, runner=runner)
+            else:
+                voice = choose_chinese_voice(_list_windows_voices(runner=runner))
+                raw_path = temp_dir / "raw.wav"
+                _synthesize_windows_raw(text_path, raw_path, voice, runner=runner)
 
-        speech = probe_audio_readback(raw_path, runtime=runtime, runner=runner)
-        master_duration_ms = max(5_000, speech.duration_ms + 300)
-        if speech.duration_ms <= 0:
-            raise MontageFailure(
-                "montage_narration_duration_invalid",
-                "配音时长无效",
+            speech = probe_audio_readback(raw_path, runtime=runtime, runner=runner)
+            master_duration_ms = max(5_000, speech.duration_ms + 300)
+            if speech.duration_ms <= 0:
+                raise MontageFailure(
+                    "montage_narration_duration_invalid",
+                    "配音时长无效",
+                )
+            if master_duration_ms > 180_000:
+                raise MontageFailure(
+                    "montage_narration_duration_invalid",
+                    "配音超过 180 秒上限",
+                )
+
+            staged_master = temp_dir / "master.m4a"
+            _normalize_master(
+                raw_path,
+                staged_master,
+                runtime=runtime,
+                master_duration_ms=master_duration_ms,
+                runner=runner,
             )
-        if master_duration_ms > 180_000:
-            raise MontageFailure(
-                "montage_narration_duration_invalid",
-                "配音超过 180 秒上限",
+            master_readback = probe_audio_readback(
+                staged_master,
+                runtime=runtime,
+                runner=runner,
             )
+            if abs(master_readback.duration_ms - master_duration_ms) > 100:
+                raise MontageFailure(
+                    "montage_narration_audio_readback_failed",
+                    "配音主音轨时长回读不一致",
+                )
+            _validate_master_format(master_readback)
+            master_sha256 = _sha256_file(staged_master)
 
-        staged_master = temp_dir / "master.m4a"
-        _normalize_master(
-            raw_path,
-            staged_master,
-            runtime=runtime,
-            master_duration_ms=master_duration_ms,
-            runner=runner,
-        )
-        master_readback = probe_audio_readback(
-            staged_master,
-            runtime=runtime,
-            runner=runner,
-        )
-        if abs(master_readback.duration_ms - master_duration_ms) > 100:
-            raise MontageFailure(
-                "montage_narration_audio_readback_failed",
-                "配音主音轨时长回读不一致",
+            target_dir_existed = target_dir.exists()
+            target_dir.mkdir(parents=True, exist_ok=True)
+            created_target_dir = not target_dir_existed
+            master_path = target_dir / "master.m4a"
+            artifact = NarrationArtifact(
+                master_path=master_path,
+                voice_id=voice.id,
+                voice_locale=voice.locale,
+                speech_duration_ms=speech.duration_ms,
+                master_duration_ms=master_duration_ms,
+                sha256=master_sha256,
+                stream_sha256=master_readback.stream_sha256,
+                codec_name=master_readback.codec_name,
+                sample_rate=master_readback.sample_rate,
+                channels=master_readback.channels,
+                format_name=master_readback.format_name,
             )
-
-        target_dir.mkdir(parents=True, exist_ok=True)
-        master_path = target_dir / "master.m4a"
-        os.replace(staged_master, master_path)
-        return NarrationArtifact(
-            master_path=master_path,
-            voice_id=voice.id,
-            voice_locale=voice.locale,
-            speech_duration_ms=speech.duration_ms,
-            master_duration_ms=master_duration_ms,
-            sha256=_sha256_file(master_path),
-            stream_sha256=master_readback.stream_sha256,
-        )
+            os.replace(staged_master, master_path)
+            return artifact
+    except MontageFailure:
+        raise
+    except OSError as exc:
+        if created_target_dir:
+            try:
+                target_dir.rmdir()
+            except OSError:
+                pass
+        raise MontageFailure(
+            "montage_narration_synthesis_failed",
+            "配音文件写入失败",
+        ) from exc

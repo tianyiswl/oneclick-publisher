@@ -34,6 +34,25 @@ class NarrationServiceTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tempdir.cleanup()
 
+    @staticmethod
+    def audio_readback(
+        duration_ms: int,
+        stream_sha256: str,
+        *,
+        codec_name: str = "aac",
+        sample_rate: int = 48_000,
+        channels: int = 2,
+        format_name: str = "mov,mp4,m4a,3gp,3g2,mj2",
+    ) -> AudioReadback:
+        return AudioReadback(
+            duration_ms=duration_ms,
+            stream_sha256=stream_sha256,
+            codec_name=codec_name,
+            sample_rate=sample_rate,
+            channels=channels,
+            format_name=format_name,
+        )
+
     def test_choose_chinese_voice_prefers_simplified_chinese(self) -> None:
         selected = choose_chinese_voice(
             (
@@ -106,8 +125,15 @@ class NarrationServiceTests(unittest.TestCase):
         ), patch(
             "app_core.narration_service.probe_audio_readback",
             side_effect=(
-                AudioReadback(3_200, "1" * 64),
-                AudioReadback(5_000, "2" * 64),
+                self.audio_readback(
+                    3_200,
+                    "1" * 64,
+                    codec_name="pcm_s16be",
+                    sample_rate=22_050,
+                    channels=1,
+                    format_name="aiff",
+                ),
+                self.audio_readback(5_000, "2" * 64),
             ),
         ):
             artifact = synthesize_system_narration(
@@ -120,6 +146,14 @@ class NarrationServiceTests(unittest.TestCase):
         self.assertEqual(artifact.speech_duration_ms, 3_200)
         self.assertEqual(artifact.master_duration_ms, 5_000)
         self.assertEqual(artifact.stream_sha256, "2" * 64)
+        self.assertEqual(artifact.codec_name, "aac")
+        self.assertEqual(artifact.sample_rate, 48_000)
+        self.assertEqual(artifact.channels, 2)
+        self.assertIn("m4a", artifact.format_name.split(","))
+        self.assertEqual(artifact.to_dict()["codec_name"], "aac")
+        self.assertEqual(artifact.to_dict()["sample_rate"], 48_000)
+        self.assertEqual(artifact.to_dict()["channels"], 2)
+        self.assertIn("m4a", str(artifact.to_dict()["format_name"]).split(","))
         self.assertTrue(artifact.master_path.is_file())
 
     def test_zero_or_over_180_second_narration_fails_before_normalization(self) -> None:
@@ -138,7 +172,14 @@ class NarrationServiceTests(unittest.TestCase):
                 side_effect=create_raw,
             ), patch(
                 "app_core.narration_service.probe_audio_readback",
-                return_value=AudioReadback(speech_duration_ms, "1" * 64),
+                return_value=self.audio_readback(
+                    speech_duration_ms,
+                    "1" * 64,
+                    codec_name="pcm_s16be",
+                    sample_rate=22_050,
+                    channels=1,
+                    format_name="aiff",
+                ),
             ), self.assertRaises(MontageFailure) as caught:
                 synthesize_system_narration(
                     "测试文案",
@@ -213,6 +254,266 @@ class NarrationServiceTests(unittest.TestCase):
                     caught.exception.code,
                     "montage_narration_audio_readback_failed",
                 )
+
+    def test_audio_readback_records_stream_and_container_format(self) -> None:
+        audio_path = self.root / "master.m4a"
+        audio_path.write_bytes(b"audio")
+        expected_format = "mov,mp4,m4a,3gp,3g2,mj2"
+
+        def format_runner(command: list[str], **_kwargs: object):
+            if Path(command[0]) == self.runtime.ffprobe:
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout=(
+                        '{"streams":[{"codec_type":"audio","codec_name":"aac",'
+                        '"sample_rate":"48000","channels":2,"duration":"5.001"}],'
+                        f'"format":{{"duration":"5.001","format_name":"{expected_format}"}}}}'
+                    ),
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=f'SHA256={"a" * 64}\n',
+                stderr="",
+            )
+
+        readback = probe_audio_readback(
+            audio_path,
+            runtime=self.runtime,
+            runner=format_runner,
+        )
+        self.assertEqual(
+            readback,
+            self.audio_readback(5_001, "a" * 64, format_name=expected_format),
+        )
+
+    def test_master_with_wrong_audio_format_is_rejected_before_install(self) -> None:
+        def create_raw(_text_path, raw_path, _voice, **_kwargs):
+            Path(raw_path).write_bytes(b"raw")
+
+        def create_master(command: list[str], **_kwargs: object):
+            Path(command[-1]).write_bytes(b"master")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        invalid_formats = (
+            {"codec_name": "mp3"},
+            {"sample_rate": 44_100},
+            {"channels": 1},
+            {"format_name": "mp3"},
+        )
+        for index, overrides in enumerate(invalid_formats):
+            output_dir = self.root / f"wrong-format-{index}"
+            with self.subTest(**overrides), patch(
+                "app_core.narration_service._list_macos_voices",
+                return_value=(SystemVoice("Test Chinese", "zh-CN"),),
+            ), patch(
+                "app_core.narration_service._synthesize_macos_raw",
+                side_effect=create_raw,
+            ), patch(
+                "app_core.narration_service.probe_audio_readback",
+                side_effect=(
+                    self.audio_readback(
+                        3_200,
+                        "1" * 64,
+                        codec_name="pcm_s16be",
+                        sample_rate=22_050,
+                        channels=1,
+                        format_name="aiff",
+                    ),
+                    self.audio_readback(5_000, "2" * 64, **overrides),
+                ),
+            ), self.assertRaises(MontageFailure) as caught:
+                synthesize_system_narration(
+                    "短文案",
+                    output_dir,
+                    runtime=self.runtime,
+                    platform_name="darwin",
+                    runner=create_master,
+                )
+            self.assertEqual(
+                caught.exception.code,
+                "montage_narration_audio_readback_failed",
+            )
+            self.assertFalse((output_dir / "master.m4a").exists())
+
+    def test_output_directory_and_text_write_errors_have_stable_error(self) -> None:
+        for operation, patcher in (
+            ("output directory", patch.object(Path, "mkdir", side_effect=PermissionError("denied"))),
+            ("temporary text", patch.object(Path, "write_text", side_effect=PermissionError("denied"))),
+        ):
+            with self.subTest(operation=operation), patcher, self.assertRaises(Exception) as caught:
+                synthesize_system_narration(
+                    "不能泄漏的文案",
+                    self.root / f"failure-{operation}",
+                    runtime=self.runtime,
+                    platform_name="darwin",
+                )
+            self.assertIsInstance(caught.exception, MontageFailure)
+            self.assertEqual(
+                caught.exception.code,
+                "montage_narration_synthesis_failed",
+            )
+            self.assertNotIn("不能泄漏的文案", str(caught.exception))
+
+    def test_windows_script_write_error_has_stable_error(self) -> None:
+        text_path = self.root / "narration.txt"
+        text_path.write_text("测试", encoding="utf-8")
+        with patch.object(
+            Path,
+            "write_text",
+            side_effect=PermissionError("denied"),
+        ), self.assertRaises(Exception) as caught:
+            _synthesize_windows_raw(
+                text_path,
+                self.root / "raw.wav",
+                SystemVoice("Test Chinese", "zh-CN"),
+            )
+        self.assertIsInstance(caught.exception, MontageFailure)
+        self.assertEqual(caught.exception.code, "montage_narration_synthesis_failed")
+
+    def test_replace_error_has_stable_error_and_leaves_no_new_master(self) -> None:
+        output_dir = self.root / "replace-failure"
+
+        def create_raw(_text_path, raw_path, _voice, **_kwargs):
+            Path(raw_path).write_bytes(b"raw")
+
+        def create_master(command: list[str], **_kwargs: object):
+            Path(command[-1]).write_bytes(b"master")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with patch(
+            "app_core.narration_service._list_macos_voices",
+            return_value=(SystemVoice("Test Chinese", "zh-CN"),),
+        ), patch(
+            "app_core.narration_service._synthesize_macos_raw",
+            side_effect=create_raw,
+        ), patch(
+            "app_core.narration_service.probe_audio_readback",
+            side_effect=(
+                self.audio_readback(
+                    3_200,
+                    "1" * 64,
+                    codec_name="pcm_s16be",
+                    sample_rate=22_050,
+                    channels=1,
+                    format_name="aiff",
+                ),
+                self.audio_readback(5_000, "2" * 64),
+            ),
+        ), patch(
+            "app_core.narration_service.os.replace",
+            side_effect=PermissionError("denied"),
+        ), self.assertRaises(Exception) as caught:
+            synthesize_system_narration(
+                "短文案",
+                output_dir,
+                runtime=self.runtime,
+                platform_name="darwin",
+                runner=create_master,
+            )
+        self.assertIsInstance(caught.exception, MontageFailure)
+        self.assertEqual(caught.exception.code, "montage_narration_synthesis_failed")
+        self.assertFalse((output_dir / "master.m4a").exists())
+
+    def test_master_hash_is_calculated_before_atomic_replace(self) -> None:
+        output_dir = self.root / "hash-order"
+        hashed_paths: list[Path] = []
+
+        def create_raw(_text_path, raw_path, _voice, **_kwargs):
+            Path(raw_path).write_bytes(b"raw")
+
+        def create_master(command: list[str], **_kwargs: object):
+            Path(command[-1]).write_bytes(b"master")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        def record_hash(path: Path) -> str:
+            hashed_paths.append(Path(path))
+            return "3" * 64
+
+        with patch(
+            "app_core.narration_service._list_macos_voices",
+            return_value=(SystemVoice("Test Chinese", "zh-CN"),),
+        ), patch(
+            "app_core.narration_service._synthesize_macos_raw",
+            side_effect=create_raw,
+        ), patch(
+            "app_core.narration_service.probe_audio_readback",
+            side_effect=(
+                self.audio_readback(
+                    3_200,
+                    "1" * 64,
+                    codec_name="pcm_s16be",
+                    sample_rate=22_050,
+                    channels=1,
+                    format_name="aiff",
+                ),
+                self.audio_readback(5_000, "2" * 64),
+            ),
+        ), patch(
+            "app_core.narration_service._sha256_file",
+            side_effect=record_hash,
+        ):
+            artifact = synthesize_system_narration(
+                "短文案",
+                output_dir,
+                runtime=self.runtime,
+                platform_name="darwin",
+                runner=create_master,
+            )
+        self.assertEqual(artifact.sha256, "3" * 64)
+        self.assertEqual(len(hashed_paths), 1)
+        self.assertNotEqual(hashed_paths[0], artifact.master_path)
+        self.assertFalse(hashed_paths[0].exists())
+        self.assertTrue(artifact.master_path.is_file())
+
+    def test_hash_failure_preserves_existing_master(self) -> None:
+        output_dir = self.root / "hash-failure"
+        output_dir.mkdir()
+        master_path = output_dir / "master.m4a"
+        master_path.write_bytes(b"existing-master")
+
+        def create_raw(_text_path, raw_path, _voice, **_kwargs):
+            Path(raw_path).write_bytes(b"raw")
+
+        def create_master(command: list[str], **_kwargs: object):
+            Path(command[-1]).write_bytes(b"new-master")
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        with patch(
+            "app_core.narration_service._list_macos_voices",
+            return_value=(SystemVoice("Test Chinese", "zh-CN"),),
+        ), patch(
+            "app_core.narration_service._synthesize_macos_raw",
+            side_effect=create_raw,
+        ), patch(
+            "app_core.narration_service.probe_audio_readback",
+            side_effect=(
+                self.audio_readback(
+                    3_200,
+                    "1" * 64,
+                    codec_name="pcm_s16be",
+                    sample_rate=22_050,
+                    channels=1,
+                    format_name="aiff",
+                ),
+                self.audio_readback(5_000, "2" * 64),
+            ),
+        ), patch(
+            "app_core.narration_service._sha256_file",
+            side_effect=PermissionError("denied"),
+        ), self.assertRaises(Exception) as caught:
+            synthesize_system_narration(
+                "短文案",
+                output_dir,
+                runtime=self.runtime,
+                platform_name="darwin",
+                runner=create_master,
+            )
+        self.assertIsInstance(caught.exception, MontageFailure)
+        self.assertEqual(caught.exception.code, "montage_narration_synthesis_failed")
+        self.assertEqual(master_path.read_bytes(), b"existing-master")
 
 
 if __name__ == "__main__":
