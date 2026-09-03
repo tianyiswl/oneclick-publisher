@@ -1,0 +1,8 @@
+test_authorized_schedule_is_visible_on_publish_page_before_task_start (test_desktop_wechat_schedule_wiring.DesktopWechatScheduleWiringTests.test_authorized_schedule_is_visible_on_publish_page_before_task_start)
+新增页面后，已授权任务仍必须先切到用户可见的发布中心。 ... ONECLICK_DEV_WECHAT_SCHEDULE_STARTED taskId=42 taskNo=T-SCHEDULE schedule=2099-09-03 10:00
+ok
+
+----------------------------------------------------------------------
+Ran 1 test in 0.003s
+
+OK

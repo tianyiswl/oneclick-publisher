@@ -1,0 +1,15 @@
+{
+  "channels": 2,
+  "codec_name": "aac",
+  "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+  "master_duration_ms": 8938,
+  "master_path": "/Users/andy/Documents/Codex/2026-07-28/new-chat/outputs/一键发桌面UI基座/.worktrees/integration-oneclick-0.5.30-stable/.superpowers/sdd/2026-09-03-oneclick-automatic-montage-system-narration/fix-round-2-evidence/integration-batch-head-f86ce81/M-NARRATION-INTEGRATION/narration/master.m4a",
+  "sample_rate": 48000,
+  "schema_version": "oneclick-montage-narration/v1",
+  "sha256": "cc620750956d539724379cd532abf932773e5d20cd5a5cdbd9c2d8746f3eaec9",
+  "speech_duration_ms": 8638,
+  "status": "success",
+  "stream_sha256": "44d855f9f8e9506d06583dda2e9855006ad592060b750ee5cac242ff0c5344c2",
+  "voice_id": "Eddy (中文（中国大陆）)",
+  "voice_locale": "zh-CN"
+}

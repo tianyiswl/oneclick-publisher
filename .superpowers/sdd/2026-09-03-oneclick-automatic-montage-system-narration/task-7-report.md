@@ -2,9 +2,9 @@
 
 日期：2026-09-03
 
-状态：纯净源码快照与隔离 Mac 中性素材批次机器验收通过；人工听审待大帅确认；Windows 仍只有适配器合同测试。
+状态：纯净源码快照与隔离 Mac 中性素材批次机器验收通过；公众号已授权定时入口导航已回归；客户端与 QuickTime 听审停点已关闭，人工听感仍待大帅以后确认；Windows 仍只有适配器合同测试。
 
-> Fix round 1 审计说明：本报告前半部分保留初始轮次的原始记录以便追溯，但其中混合工作树上的 `77/77`、`3175/3175`、`NATIVE_DESKTOP_UI_OK`、源码启动，以及写入正式用户数据目录并混用两个内容来源的批次 `M0903160612-1765F3`，均已撤销为验收证据。当前结论只以文末“Fix round 1”章节的纯净快照与隔离证据为准；旧正式目录批次没有删除、覆盖或改写。
+> 审计说明：本报告前半部分保留初始轮次的原始记录以便追溯，但其中混合工作树上的 `77/77`、`3175/3175`、`NATIVE_DESKTOP_UI_OK`、源码启动，以及写入正式用户数据目录并混用两个内容来源的批次 `M0903160612-1765F3`，均已撤销为验收证据。当前实现与回归结论以文末“Fix round 2”的纯净提交为准；Mac 隔离真实批次、Archify 和旧批次保留边界继续以“Fix round 1”为准。旧正式目录批次没有删除、覆盖或改写。
 
 ## 做了什么
 
@@ -157,3 +157,35 @@ YIJIANFA_USER_DATA_DIR='<fix-evidence>/ui-test-head-606925f' \
 - 当前脏工作树中原有的账号/Meta 修改、其测试和 `automatic-video-production*` 产物继续原样保留，未被本任务提交。源码接线提交只包含 6 个明确文件；文档收口提交只包含本报告、权威文档、两张 narration 图的 visual-check sidecar 和必要隔离证据。
 - `QUALITY_GATES.md` 已明确：第四条本地内容生产线不属于原三条 `check_workstream_scope.py` stream 参数；它使用文档中的可执行定向测试，改到共享核心时再由集成线跑完整回归、离屏客户端与差异检查。
 - 唯一未完成项是人工听审；在大帅确认前，准确状态只能是“Mac 隔离批次机器回读通过，人工听感待确认”。
+
+## Fix round 2：公众号已授权定时入口可见性修复
+
+### Important 根因与最小修复
+
+新增“自动混剪”页后，`desktop_native_app.start_authorized_wechat_schedule()` 仍用固定索引 `window._set_current_page(3)` 跳转。索引 3 现在对应自动混剪，发布中心已移到索引 4；紧接着的已授权公众号定时任务因此会在用户不可见的发布页启动。
+
+修复只改一处生产代码：改用公共稳定方法 `window.set_current_page_by_key("publish")`，不再依赖会因新页面插入而漂移的数字索引。新增 `test_desktop_wechat_schedule_wiring.py` 直接执行真实入口函数，并在 `publish_service.start_desktop_publish()` 被调用的瞬间断言用户可见页已是 `publish`。
+
+### TDD RED / GREEN
+
+- RED 在纯净基线 `1dc3a54e13f6a4deea887f54f1d47b361641faac` 上新增回归后运行：`1` 项测试如预期失败，明确报出 `'montage' != 'publish'` 和 `authorized WeChat schedule started while its page was hidden`。
+- GREEN 改用页面 key 后重跑同一用例：`1/1`、`OK`、`0.003s`。
+- 纯净验证提交为 `f86ce818cf3f9512999ae32565f28465be8579e5`，实际分支对应提交为 `ce9c41c1bd0f1671261aaa13c17328d315f76bdf`；两者 tree object 都是 `fdaf94c9a888ab6c76d9870a175a0ab0a901a482`，因此纯净快照中验证的源码与分支提交逐字一致。
+
+### 纯净提交回归结果
+
+所有以下命令均在 detached 临时 worktree `/private/tmp/oneclick-task7-fix1-663b68e` 的纯净 `f86ce81` 上运行，验证前后 `git status --porcelain` 均为空：
+
+1. 公众号已授权入口、发布页、草稿桥接、公众号执行器/预检与主窗口套件：`120/120`，`OK`，`8.787s`。
+2. 定向自动混剪套件：`76/76`，`OK`，`6.608s`；真实 Mac 系统配音集成未跳过。所有请求、回执与输出只位于 `fix-round-2-evidence/integration-batch-head-f86ce81/`，批次回读 `success=3`、`failed=0`、讲话 `8638ms`、主音轨/成片 `8938ms`。
+3. 隔离用户数据的离屏源码客户端：退出码 `0`，`NATIVE_DESKTOP_UI_OK`。
+4. 共享桌面入口改动后的完整回归：`3175/3175`，`OK`，`192.909s`。
+
+完整命令、输出日志、SHA-256 与进程边界见 `fix-round-2-evidence/command-receipts.md`。提交仅纳入这些命令日志和隔离批次的 JSON 回执，不纳入媒体成片或无关架构产物。
+
+### 源码启动、听审与保留边界
+
+- Fix round 1 的纯净源码客户端已退出，当时打开的 QuickTime `video.mp4` 窗口已关闭。Fix round 2 没有重新启动可视客户端，也没有保留 `0:00` 人工听审停点。
+- 本轮没有播放音频，不宣称人工听感通过。Fix round 1 的隔离 Mac 机器回读仍有效，但人工听感仍待大帅以后另行听审。
+- 未改版本、未打包、未安装替换、未推送，未创建发布任务，未操作任何平台或账号。Windows 仍只有合同级单测，没有 Windows 真机验收。
+- 原工作树中的账号/Meta 改动、自动视频生产产物和其他无关脏改动继续原样保留，本轮不归因、不纳入。

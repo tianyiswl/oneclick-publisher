@@ -1,0 +1,2 @@
+qt.qpa.fonts: Populating font family aliases took 51 ms. Replace uses of missing font family "Sans Serif" with one that exists to avoid this cost.
+NATIVE_DESKTOP_UI_OK
