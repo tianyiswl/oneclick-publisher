@@ -113,14 +113,17 @@ class MontageServiceTests(unittest.TestCase):
         self.assertEqual([item[1] for item in rendered], [5_300, 5_300])
         self.assertTrue(all(item[2] is artifact for item in rendered))
         self.assertEqual(result.narration["sha256"], "a" * 64)
-        request_receipt = json.loads(
-            (result.batch_dir / "request.json").read_text(encoding="utf-8")
+        request_receipt_text = (result.batch_dir / "request.json").read_text(
+            encoding="utf-8"
         )
+        request_receipt = json.loads(request_receipt_text)
         narration_receipt = json.loads(
             (result.batch_dir / "narration" / "receipt.json").read_text(encoding="utf-8")
         )
         batch_receipt = json.loads(result.receipt_path.read_text(encoding="utf-8"))
         self.assertEqual(request_receipt["schema_version"], "oneclick-montage-request/v2")
+        self.assertNotIn("narration_text", request_receipt)
+        self.assertNotIn("完整解说", request_receipt_text)
         self.assertEqual(
             narration_receipt["schema_version"],
             "oneclick-montage-narration/v1",
@@ -160,13 +163,45 @@ class MontageServiceTests(unittest.TestCase):
         self.assertEqual([item["status"] for item in result.outputs], ["failed", "success"])
         self.assertEqual(result.outputs[0]["narration_sha256"], "a" * 64)
 
+    def test_narration_clip_failure_keeps_effective_master_duration(self) -> None:
+        artifact = self.narration_artifact()
+
+        with self.assertRaises(MontageFailure) as caught:
+            run_montage_batch(
+                self.request(
+                    audio_mode="narration",
+                    narration_text="解说",
+                    clip_duration_ms=6_000,
+                ),
+                output_root=self.output_root,
+                runtime=self.runtime,
+                batch_id="M-NARRATION-CLIP-FAILED",
+                probe=self.fake_probe,
+                narrator=lambda *_args, **_kwargs: artifact,
+                renderer=self.fake_renderer,
+            )
+
+        self.assertEqual(caught.exception.code, "montage_clip_duration_invalid")
+        batch_receipt = json.loads(
+            (
+                self.output_root
+                / "M-NARRATION-CLIP-FAILED"
+                / "batch-receipt.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(batch_receipt["effective_target_duration_ms"], 5_300)
+
     def test_narration_failure_writes_narration_and_batch_terminal_receipts(self) -> None:
         def narrator(*_args, **_kwargs):
             raise MontageFailure("montage_narration_voice_unavailable", "没有中文声音")
 
         with self.assertRaises(MontageFailure):
             run_montage_batch(
-                self.request(audio_mode="narration", narration_text="解说"),
+                self.request(
+                    audio_mode="narration",
+                    narration_text="解说",
+                    output_count=3,
+                ),
                 output_root=self.output_root,
                 runtime=self.runtime,
                 batch_id="M-NARRATION-FAILED",
@@ -188,7 +223,70 @@ class MontageServiceTests(unittest.TestCase):
             batch_receipt["schema_version"],
             "oneclick-montage-batch-receipt/v2",
         )
+        self.assertEqual(batch_receipt["summary"], {"success": 0, "failed": 3})
+        self.assertEqual(len(batch_receipt["outputs"]), 3)
+        self.assertTrue(
+            all(item["status"] == "failed" for item in batch_receipt["outputs"])
+        )
+        self.assertTrue(
+            all(
+                item["error_code"] == "montage_output_not_run"
+                for item in batch_receipt["outputs"]
+            )
+        )
+        self.assertTrue(
+            all(
+                item["details"]["cause_error_code"]
+                == "montage_narration_voice_unavailable"
+                for item in batch_receipt["outputs"]
+            )
+        )
         self.assertNotIn("running", batch_receipt.values())
+
+    def test_batch_abort_marks_every_remaining_output_not_run(self) -> None:
+        raised = False
+
+        def progress(event: dict[str, object]) -> None:
+            nonlocal raised
+            if (
+                not raised
+                and event.get("stage") == "output_completed"
+                and event.get("output_index") == 1
+            ):
+                raised = True
+                raise MontageFailure("montage_progress_failed", "进度回调失败")
+
+        with self.assertRaises(MontageFailure):
+            run_montage_batch(
+                self.request(),
+                output_root=self.output_root,
+                runtime=self.runtime,
+                batch_id="M-PARTIAL-BATCH-ABORT",
+                probe=self.fake_probe,
+                renderer=self.fake_renderer,
+                progress=progress,
+            )
+
+        batch_receipt = json.loads(
+            (
+                self.output_root
+                / "M-PARTIAL-BATCH-ABORT"
+                / "batch-receipt.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(batch_receipt["summary"], {"success": 1, "failed": 1})
+        self.assertEqual(
+            [item["status"] for item in batch_receipt["outputs"]],
+            ["success", "failed"],
+        )
+        self.assertEqual(
+            batch_receipt["outputs"][1]["error_code"],
+            "montage_output_not_run",
+        )
+        self.assertEqual(
+            batch_receipt["outputs"][1]["details"]["cause_error_code"],
+            "montage_progress_failed",
+        )
 
     def test_success_writes_isolated_outputs_and_atomic_terminal_receipt(self) -> None:
         events: list[dict[str, object]] = []

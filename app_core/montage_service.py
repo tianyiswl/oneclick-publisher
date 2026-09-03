@@ -105,6 +105,25 @@ def _failed_output(
     return receipt
 
 
+def _not_run_output(
+    index: int,
+    failure: MontageFailure,
+    *,
+    narration_sha256: str | None = None,
+) -> dict[str, object]:
+    receipt: dict[str, object] = {
+        "index": index,
+        "status": "failed",
+        "fingerprint": None,
+        "error_code": "montage_output_not_run",
+        "error": "批次在该成片执行前失败",
+        "details": {"cause_error_code": failure.code},
+    }
+    if narration_sha256 is not None:
+        receipt["narration_sha256"] = narration_sha256
+    return receipt
+
+
 def run_montage_batch(
     request: MontageRequest,
     *,
@@ -131,13 +150,15 @@ def run_montage_batch(
         ) from exc
     receipt_path = batch_dir / "batch-receipt.json"
     started_at = _now_text()
+    persisted_request = request.to_dict()
+    persisted_request.pop("narration_text", None)
     _write_json_atomic(
         batch_dir / "request.json",
         {
             "schema_version": "oneclick-montage-request/v2",
             "batch_id": resolved_batch_id,
             "created_at": started_at,
-            **request.to_dict(),
+            **persisted_request,
         },
     )
 
@@ -183,6 +204,10 @@ def run_montage_batch(
                 )
                 raise failure
             narration_payload = narration.to_dict()
+            planning_request = replace(
+                request,
+                target_duration_ms=narration.master_duration_ms,
+            )
             _write_json_atomic(
                 batch_dir / "narration" / "receipt.json",
                 {
@@ -196,10 +221,6 @@ def run_montage_batch(
                     "montage_clip_duration_invalid",
                     "镜头时长不能超过配音决定的成片时长",
                 )
-            planning_request = replace(
-                request,
-                target_duration_ms=narration.master_duration_ms,
-            )
 
         _emit(progress, "planning", output_count=request.output_count)
         plans = plan_montages(planning_request, assets)
@@ -302,6 +323,16 @@ def run_montage_batch(
                 "montage_batch_failed",
                 str(exc) or exc.__class__.__name__,
             )
+        for index in range(len(outputs) + 1, request.output_count + 1):
+            outputs.append(
+                _not_run_output(
+                    index,
+                    failure,
+                    narration_sha256=narration.sha256 if narration else None,
+                )
+            )
+        success_count = sum(item.get("status") == "success" for item in outputs)
+        failed_count = sum(item.get("status") == "failed" for item in outputs)
         receipt = {
             "schema_version": "oneclick-montage-batch-receipt/v2",
             "batch_id": resolved_batch_id,
@@ -309,8 +340,8 @@ def run_montage_batch(
             "started_at": started_at,
             "finished_at": _now_text(),
             "summary": {
-                "success": sum(item.get("status") == "success" for item in outputs),
-                "failed": max(1, sum(item.get("status") == "failed" for item in outputs)),
+                "success": success_count,
+                "failed": failed_count,
             },
             "outputs": outputs,
             "effective_target_duration_ms": planning_request.target_duration_ms,
