@@ -17,6 +17,7 @@ from app_core.narration_service import (
     synthesize_system_narration,
     _parse_macos_voices,
     _parse_windows_voices,
+    _list_windows_voices,
     _synthesize_macos_raw,
     _synthesize_windows_raw,
 )
@@ -63,6 +64,36 @@ class NarrationServiceTests(unittest.TestCase):
         )
         self.assertEqual(selected.id, "Mainland")
 
+    def test_choose_chinese_voice_prefers_hans_locale(self) -> None:
+        selected = choose_chinese_voice(
+            (
+                SystemVoice("Macao", "zh-MO"),
+                SystemVoice("Simplified", "zh_Hans"),
+            )
+        )
+        self.assertEqual(selected.id, "Simplified")
+
+    def test_choose_chinese_voice_accepts_macao_locale(self) -> None:
+        selected = choose_chinese_voice(
+            (
+                SystemVoice("English", "en-US"),
+                SystemVoice("Macao", "zh-MO"),
+            )
+        )
+        self.assertEqual(selected.id, "Macao")
+
+    def test_choose_chinese_voice_stably_sorts_mixed_language_voices(self) -> None:
+        selected = choose_chinese_voice(
+            (
+                SystemVoice("Japanese", "ja-JP"),
+                SystemVoice("Macao Z", "zh-MO"),
+                SystemVoice("English", "en-US"),
+                SystemVoice("Traditional Z", "zh-Hant"),
+                SystemVoice("Traditional A", "ZH_hant"),
+            )
+        )
+        self.assertEqual(selected.id, "Traditional A")
+
     def test_choose_chinese_voice_never_falls_back_to_english(self) -> None:
         with self.assertRaises(MontageFailure) as caught:
             choose_chinese_voice((SystemVoice("English", "en-US"),))
@@ -78,6 +109,53 @@ class NarrationServiceTests(unittest.TestCase):
         )
         self.assertEqual(mac[0], SystemVoice("Ting-Ting", "zh-CN"))
         self.assertEqual(windows, (SystemVoice("Microsoft Huihui Desktop", "zh-CN"),))
+
+    def test_macos_voice_list_accepts_script_and_macao_locales(self) -> None:
+        voices = _parse_macos_voices(
+            "Simplified            zh_Hans  # 你好！\n"
+            "Macao                 zh_MO    # 你好！\n"
+            "English               en_US    # Hello!\n"
+        )
+        self.assertEqual(
+            voices,
+            (
+                SystemVoice("Simplified", "zh-Hans"),
+                SystemVoice("Macao", "zh-MO"),
+                SystemVoice("English", "en-US"),
+            ),
+        )
+
+    def test_windows_voice_parser_accepts_zero_voices(self) -> None:
+        self.assertEqual(_parse_windows_voices("[]"), ())
+
+    def test_windows_voice_parser_normalizes_one_voice_object(self) -> None:
+        self.assertEqual(
+            _parse_windows_voices(
+                '{"id":"Microsoft Huihui Desktop","locale":"zh-CN"}'
+            ),
+            (SystemVoice("Microsoft Huihui Desktop", "zh-CN"),),
+        )
+
+    def test_windows_voice_parser_accepts_multiple_voices(self) -> None:
+        self.assertEqual(
+            _parse_windows_voices(
+                '[{"id":"Microsoft Huihui Desktop","locale":"zh-CN"},'
+                '{"id":"Microsoft Tracy Desktop","locale":"zh-HK"}]'
+            ),
+            (
+                SystemVoice("Microsoft Huihui Desktop", "zh-CN"),
+                SystemVoice("Microsoft Tracy Desktop", "zh-HK"),
+            ),
+        )
+
+    def test_windows_voice_discovery_forces_json_array_at_powershell_boundary(self) -> None:
+        def runner(command: list[str], **_kwargs: object):
+            script = command[-1]
+            self.assertIn("$voices = @(", script)
+            self.assertIn("ConvertTo-Json -InputObject $voices -Compress", script)
+            return subprocess.CompletedProcess(command, 0, stdout="[]", stderr="")
+
+        self.assertEqual(_list_windows_voices(runner=runner), ())
 
     def test_macos_and_windows_pass_text_by_file_not_command_line(self) -> None:
         secret_text = "这段文案不能进入命令行"

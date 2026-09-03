@@ -18,12 +18,10 @@ from .montage_models import MontageFailure
 
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
-_CHINESE_LOCALE_PRIORITIES = {
-    "zh-cn": 0,
-    "zh-sg": 1,
-    "zh-tw": 2,
-    "zh-hk": 3,
-}
+_SIMPLIFIED_CHINESE_REGIONS = frozenset({"cn", "sg", "my"})
+_BCP47_STYLE_LOCALE = re.compile(
+    r"^[A-Za-z]{2,8}(?:[-_][A-Za-z0-9]{1,8})*$"
+)
 _WINDOWS_SYNTHESIS_SCRIPT = """param([string]$TextPath, [string]$OutputPath, [string]$VoiceName)
 Add-Type -AssemblyName System.Speech
 $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
@@ -39,9 +37,12 @@ try {
 _WINDOWS_VOICE_LIST_SCRIPT = """Add-Type -AssemblyName System.Speech
 $synth = New-Object System.Speech.Synthesis.SpeechSynthesizer
 try {
-  @($synth.GetInstalledVoices() | ForEach-Object {
-    [PSCustomObject]@{id=$_.VoiceInfo.Name; locale=$_.VoiceInfo.Culture.Name}
-  }) | ConvertTo-Json -Compress
+  $voices = @(
+    $synth.GetInstalledVoices() | ForEach-Object {
+      [PSCustomObject]@{id=$_.VoiceInfo.Name; locale=$_.VoiceInfo.Culture.Name}
+    }
+  )
+  ConvertTo-Json -InputObject $voices -Compress
 } finally {
   $synth.Dispose()
 }
@@ -101,19 +102,52 @@ class NarrationArtifact:
 
 
 def _normalized_locale(locale: str) -> str:
-    return locale.replace("_", "-").casefold()
+    value = str(locale or "").strip()
+    if not _BCP47_STYLE_LOCALE.fullmatch(value):
+        return ""
+    return value.replace("_", "-").casefold()
+
+
+def _canonical_locale(locale: str) -> str:
+    normalized = _normalized_locale(locale)
+    if not normalized:
+        return ""
+    canonical: list[str] = []
+    for index, part in enumerate(normalized.split("-")):
+        if index == 0:
+            canonical.append(part)
+        elif len(part) == 4 and part.isalpha():
+            canonical.append(part.title())
+        elif len(part) == 2 and part.isalpha():
+            canonical.append(part.upper())
+        else:
+            canonical.append(part)
+    return "-".join(canonical)
+
+
+def _is_chinese_locale(locale: str) -> bool:
+    normalized = _normalized_locale(locale)
+    return bool(normalized) and normalized.split("-", 1)[0] == "zh"
+
+
+def _is_simplified_chinese_locale(locale: str) -> bool:
+    parts = _normalized_locale(locale).split("-")
+    return "hans" in parts[1:] or any(
+        part in _SIMPLIFIED_CHINESE_REGIONS for part in parts[1:]
+    )
 
 
 def choose_chinese_voice(voices: Sequence[SystemVoice]) -> SystemVoice:
-    def rank(voice: SystemVoice) -> tuple[int, str, str]:
+    def rank(voice: SystemVoice) -> tuple[int, str, str, str]:
         locale = _normalized_locale(voice.locale)
-        return (_CHINESE_LOCALE_PRIORITIES[locale], locale, voice.id.casefold())
+        return (
+            0 if _is_simplified_chinese_locale(locale) else 1,
+            locale,
+            voice.id.casefold(),
+            voice.id,
+        )
 
-    chinese = [
-        voice
-        for voice in voices
-        if _normalized_locale(voice.locale) in _CHINESE_LOCALE_PRIORITIES
-    ]
+    chinese = [voice for voice in voices if _is_chinese_locale(voice.locale)]
     if not chinese:
         raise MontageFailure(
             "montage_narration_voice_unavailable",
@@ -125,12 +159,16 @@ def choose_chinese_voice(voices: Sequence[SystemVoice]) -> SystemVoice:
 def _parse_macos_voices(output: str) -> tuple[SystemVoice, ...]:
     voices: list[SystemVoice] = []
     for line in str(output or "").splitlines():
-        match = re.match(r"^(.+?)\s+([A-Za-z]{2}[_-][A-Za-z]{2})\s+#", line)
+        match = re.match(
+            r"^(.+?)\s+([A-Za-z]{2,8}(?:[_-][A-Za-z0-9]{1,8})*)\s+#",
+            line,
+        )
         if not match:
             continue
         name, locale = match.groups()
-        language, region = locale.replace("_", "-").split("-", 1)
-        voices.append(SystemVoice(name.strip(), f"{language.lower()}-{region.upper()}"))
+        canonical_locale = _canonical_locale(locale)
+        if canonical_locale:
+            voices.append(SystemVoice(name.strip(), canonical_locale))
     return tuple(voices)
 
 
@@ -139,6 +177,8 @@ def _parse_windows_voices(output: str) -> tuple[SystemVoice, ...]:
         payload = json.loads(str(output or ""))
     except (TypeError, json.JSONDecodeError):
         return ()
+    if isinstance(payload, dict):
+        payload = [payload]
     if not isinstance(payload, list):
         return ()
     voices: list[SystemVoice] = []
@@ -148,7 +188,9 @@ def _parse_windows_voices(output: str) -> tuple[SystemVoice, ...]:
         voice_id = item.get("id")
         locale = item.get("locale")
         if isinstance(voice_id, str) and voice_id.strip() and isinstance(locale, str):
-            voices.append(SystemVoice(voice_id.strip(), locale.replace("_", "-")))
+            canonical_locale = _canonical_locale(locale)
+            if canonical_locale:
+                voices.append(SystemVoice(voice_id.strip(), canonical_locale))
     return tuple(voices)
 
 
