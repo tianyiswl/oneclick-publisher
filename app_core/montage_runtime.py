@@ -15,6 +15,7 @@ import tempfile
 from typing import Callable
 
 from .montage_models import MontageFailure, MontagePlan, VideoAsset
+from .narration_service import NarrationArtifact, probe_audio_readback
 from .paths import ROOT_DIR
 
 
@@ -271,7 +272,7 @@ def _segment_command(
         "-pix_fmt",
         "yuv420p",
     ]
-    if audio_mode == "mute":
+    if audio_mode in {"mute", "narration"}:
         return base + [
             "-t",
             duration,
@@ -343,13 +344,16 @@ def render_montage(
     *,
     runtime: MontageRuntime,
     audio_mode: str,
+    narration: NarrationArtifact | None = None,
     runner: Runner = subprocess.run,
     progress: Callable[[dict[str, object]], None] | None = None,
 ) -> dict[str, object]:
     """把冻结计划渲染为正式 MP4；通过回读前不会写入目标文件。"""
 
-    if audio_mode not in {"mute", "source"}:
+    if audio_mode not in {"mute", "source", "narration"}:
         raise MontageFailure("montage_audio_mode_invalid", "音频模式无效")
+    if audio_mode == "narration" and narration is None:
+        raise MontageFailure("montage_narration_audio_readback_failed", "本批次缺少配音主音轨")
     target = Path(output_path).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -391,6 +395,7 @@ def render_montage(
                 "".join(f"file '{segment.as_posix()}'\n" for segment in segments),
                 encoding="utf-8",
             )
+            silent_video = temp_root / "silent-video.mp4"
             staged_output = temp_root / "video.mp4"
             _run_render_command(
                 [
@@ -409,12 +414,41 @@ def render_montage(
                     "copy",
                     "-movflags",
                     "+faststart",
-                    str(staged_output),
+                    str(silent_video if audio_mode == "narration" else staged_output),
                 ],
                 runner=runner,
                 stage="成片合并",
                 timeout=max(120, plan.total_duration_ms / 1000 * 10),
             )
+            if audio_mode == "narration":
+                assert narration is not None
+                _run_render_command(
+                    [
+                        str(runtime.ffmpeg),
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-y",
+                        "-i",
+                        str(silent_video),
+                        "-i",
+                        str(narration.master_path),
+                        "-map",
+                        "0:v:0",
+                        "-map",
+                        "1:a:0",
+                        "-c:v",
+                        "copy",
+                        "-c:a",
+                        "copy",
+                        "-movflags",
+                        "+faststart",
+                        str(staged_output),
+                    ],
+                    runner=runner,
+                    stage="配音主音轨合并",
+                    timeout=max(120, plan.total_duration_ms / 1000 * 10),
+                )
             result = probe_video(staged_output, runtime=runtime, runner=runner)
             problems: list[str] = []
             if (result.width, result.height) != (1080, 1920):
@@ -425,6 +459,21 @@ def render_montage(
                 problems.append("静音模式仍包含音轨")
             if audio_mode == "source" and not result.has_audio:
                 problems.append("原声模式缺少音轨")
+            audio_stream_sha256: str | None = None
+            if audio_mode == "narration":
+                assert narration is not None
+                audio = probe_audio_readback(staged_output, runtime=runtime, runner=runner)
+                audio_stream_sha256 = audio.stream_sha256
+                if abs(audio.duration_ms - plan.total_duration_ms) > 500:
+                    problems.append(f"配音时长为 {audio.duration_ms / 1000:.2f} 秒")
+                if audio.stream_sha256 != narration.stream_sha256:
+                    problems.append("配音音轨内容与批次主音轨不一致")
+                if problems:
+                    raise MontageFailure(
+                        "montage_narration_audio_readback_failed",
+                        "配音成片回读未通过：" + "；".join(problems),
+                        details={"problems": problems},
+                    )
             if problems:
                 raise MontageFailure(
                     "montage_output_validation_failed",
@@ -448,4 +497,7 @@ def render_montage(
         "width": 1080,
         "height": 1920,
         "audio_mode": audio_mode,
+        "narration_sha256": narration.sha256 if narration else None,
+        "narration_stream_sha256": narration.stream_sha256 if narration else None,
+        "audio_stream_sha256": audio_stream_sha256 if audio_mode == "narration" else None,
     }

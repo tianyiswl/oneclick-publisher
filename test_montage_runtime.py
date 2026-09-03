@@ -13,6 +13,7 @@ import unittest
 from unittest.mock import patch
 
 from app_core.montage_models import MontageFailure, MontageRequest, VideoAsset, plan_montages
+from app_core.narration_service import AudioReadback, NarrationArtifact, probe_audio_readback
 from app_core.montage_runtime import (
     MontageRuntime,
     _segment_command,
@@ -146,6 +147,142 @@ class MontageRuntimeTests(unittest.TestCase):
         self.assertIn("afade=t=in:st=0:d=0.080", filter_complex)
         self.assertIn("afade=t=out:st=1.920:d=0.080", filter_complex)
 
+    def test_narration_segments_always_drop_source_audio(self) -> None:
+        ffmpeg, ffprobe = self.fixed_runtime_files()
+        runtime = MontageRuntime(ffmpeg=ffmpeg, ffprobe=ffprobe)
+
+        command = _segment_command(
+            runtime,
+            source_path=self.root / "spoken.mp4",
+            start_ms=0,
+            duration_ms=1_000,
+            source_has_audio=True,
+            audio_mode="narration",
+            output_path=self.root / "segment.mp4",
+        )
+
+        self.assertIn("-an", command)
+        self.assertNotIn("-filter_complex", command)
+
+    def test_narration_render_requires_matching_audio_stream_hash(self) -> None:
+        ffmpeg, ffprobe = self.fixed_runtime_files()
+        runtime = MontageRuntime(ffmpeg=ffmpeg, ffprobe=ffprobe)
+        source = self.root / "source.mp4"
+        source.write_bytes(b"source")
+        asset = VideoAsset(
+            local_path=source.resolve(), sha256="a" * 64, duration_ms=10_000,
+            width=1920, height=1080, fps=30, has_audio=True,
+        )
+        request = MontageRequest.from_mapping(
+            {
+                "source_paths": [str(source)], "output_count": 1,
+                "target_duration_ms": 5_000, "clip_duration_ms": 1_000,
+                "allow_reuse": False, "audio_mode": "narration",
+                "source_audio_confirmed": False, "narration_text": "测试解说",
+                "seed": 17, "title_template": "", "body_template": "",
+            }
+        )
+        plan = plan_montages(request, (asset,))[0]
+        master = self.root / "master.m4a"
+        master.write_bytes(b"master")
+        artifact = NarrationArtifact(
+            master_path=master, voice_id="Test Chinese", voice_locale="zh-CN",
+            speech_duration_ms=4_700, master_duration_ms=5_000,
+            sha256="c" * 64, stream_sha256="d" * 64,
+            codec_name="aac", sample_rate=48_000, channels=2, format_name="m4a",
+        )
+        measured = VideoAsset(
+            local_path=self.root / "staged.mp4", sha256="e" * 64,
+            duration_ms=5_000, width=1080, height=1920, fps=30, has_audio=True,
+        )
+
+        def create_output(command: list[str], **_kwargs: object) -> None:
+            target = Path(command[-1])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"rendered")
+
+        output = self.root / "output.mp4"
+        with patch(
+            "app_core.montage_runtime._run_render_command",
+            side_effect=create_output,
+        ), patch(
+            "app_core.montage_runtime.probe_video",
+            return_value=measured,
+        ), patch(
+            "app_core.montage_runtime.probe_audio_readback",
+            return_value=AudioReadback(5_000, "f" * 64, "aac", 48_000, 2, "m4a"),
+        ), self.assertRaises(MontageFailure) as caught:
+            render_montage(
+                plan, output, runtime=runtime,
+                audio_mode="narration", narration=artifact,
+            )
+        self.assertEqual(caught.exception.code, "montage_narration_audio_readback_failed")
+
+    def test_narration_render_muxes_the_shared_audio_stream_without_reencoding(self) -> None:
+        ffmpeg, ffprobe = self.fixed_runtime_files()
+        runtime = MontageRuntime(ffmpeg=ffmpeg, ffprobe=ffprobe)
+        source = self.root / "source.mp4"
+        source.write_bytes(b"source")
+        asset = VideoAsset(
+            local_path=source.resolve(), sha256="a" * 64, duration_ms=10_000,
+            width=1920, height=1080, fps=30, has_audio=True,
+        )
+        request = MontageRequest.from_mapping(
+            {
+                "source_paths": [str(source)], "output_count": 1,
+                "target_duration_ms": 5_000, "clip_duration_ms": 1_000,
+                "allow_reuse": False, "audio_mode": "narration",
+                "source_audio_confirmed": False, "narration_text": "测试解说",
+                "seed": 17, "title_template": "", "body_template": "",
+            }
+        )
+        plan = plan_montages(request, (asset,))[0]
+        master = self.root / "master.m4a"
+        master.write_bytes(b"master")
+        artifact = NarrationArtifact(
+            master_path=master, voice_id="Test Chinese", voice_locale="zh-CN",
+            speech_duration_ms=4_700, master_duration_ms=5_000,
+            sha256="c" * 64, stream_sha256="d" * 64,
+            codec_name="aac", sample_rate=48_000, channels=2, format_name="m4a",
+        )
+        measured = VideoAsset(
+            local_path=self.root / "staged.mp4", sha256="e" * 64,
+            duration_ms=5_000, width=1080, height=1920, fps=30, has_audio=True,
+        )
+        commands: list[list[str]] = []
+
+        def create_output(command: list[str], **_kwargs: object) -> None:
+            commands.append(command)
+            target = Path(command[-1])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"rendered")
+
+        output = self.root / "output.mp4"
+        with patch(
+            "app_core.montage_runtime._run_render_command",
+            side_effect=create_output,
+        ), patch(
+            "app_core.montage_runtime.probe_video",
+            return_value=measured,
+        ), patch(
+            "app_core.montage_runtime.probe_audio_readback",
+            return_value=AudioReadback(5_000, "d" * 64, "aac", 48_000, 2, "m4a"),
+        ):
+            receipt = render_montage(
+                plan, output, runtime=runtime,
+                audio_mode="narration", narration=artifact,
+            )
+
+        mux_command = commands[-1]
+        self.assertNotIn("-t", mux_command)
+        self.assertNotIn("-shortest", mux_command)
+        self.assertEqual(mux_command[mux_command.index("-c:a") + 1], "copy")
+        input_positions = [index for index, value in enumerate(mux_command) if value == "-i"]
+        self.assertEqual(mux_command[input_positions[1] + 1], str(master))
+        self.assertEqual(receipt["narration_sha256"], artifact.sha256)
+        self.assertEqual(receipt["narration_stream_sha256"], artifact.stream_sha256)
+        self.assertEqual(receipt["audio_stream_sha256"], artifact.stream_sha256)
+
     def test_render_receipt_keeps_measured_and_expected_duration_separate(self) -> None:
         ffmpeg, ffprobe = self.fixed_runtime_files()
         runtime = MontageRuntime(ffmpeg=ffmpeg, ffprobe=ffprobe)
@@ -238,6 +375,66 @@ class MontageRuntimeTests(unittest.TestCase):
         self.assertLessEqual(abs(result.duration_ms - 5_000), 500)
         self.assertEqual(receipt["fingerprint"], plan.fingerprint)
         self.assertEqual(receipt["sha256"], result.sha256)
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "requires system FFmpeg")
+    def test_real_runtime_preserves_narration_audio_stream(self) -> None:
+        ffmpeg = Path(shutil.which("ffmpeg") or "")
+        source = self.root / "source.mp4"
+        master = self.root / "master.m4a"
+        subprocess.run(
+            [
+                str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "color=c=red:s=320x180:r=30",
+                "-t", "6", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source),
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+                "-t", "5", "-c:a", "aac", "-ar", "48000", "-ac", "2", str(master),
+            ],
+            check=True,
+        )
+        runtime = MontageRuntime.resolve(resource_root=self.root)
+        asset = probe_video(source, runtime=runtime)
+        request = MontageRequest.from_mapping(
+            {
+                "source_paths": [str(source)], "output_count": 1,
+                "target_duration_ms": 5_000, "clip_duration_ms": 1_000,
+                "allow_reuse": False, "audio_mode": "narration",
+                "source_audio_confirmed": False, "narration_text": "测试解说",
+                "seed": 17, "title_template": "", "body_template": "",
+            }
+        )
+        plan = plan_montages(request, (asset,))[0]
+        master_audio = probe_audio_readback(master, runtime=runtime)
+        artifact = NarrationArtifact(
+            master_path=master,
+            voice_id="Test Chinese",
+            voice_locale="zh-CN",
+            speech_duration_ms=master_audio.duration_ms,
+            master_duration_ms=master_audio.duration_ms,
+            sha256=hashlib.sha256(master.read_bytes()).hexdigest(),
+            stream_sha256=master_audio.stream_sha256,
+            codec_name=master_audio.codec_name,
+            sample_rate=master_audio.sample_rate,
+            channels=master_audio.channels,
+            format_name=master_audio.format_name,
+        )
+
+        output = self.root / "output.mp4"
+        receipt = render_montage(
+            plan, output, runtime=runtime,
+            audio_mode="narration", narration=artifact,
+        )
+        output_audio = probe_audio_readback(output, runtime=runtime)
+
+        self.assertTrue(output.is_file())
+        self.assertLessEqual(abs(output_audio.duration_ms - plan.total_duration_ms), 500)
+        self.assertEqual(output_audio.stream_sha256, artifact.stream_sha256)
+        self.assertEqual(receipt["audio_stream_sha256"], artifact.stream_sha256)
 
 
 if __name__ == "__main__":
