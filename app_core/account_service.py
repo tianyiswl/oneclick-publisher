@@ -52,7 +52,6 @@ LOGIN_PLATFORM_OPTIONS = [
     (10, "公众号"),
     (6, "TikTok"),
     (7, "YouTube"),
-    (8, "Instagram Reels"),
 ]
 OVERSEAS_PLATFORM_TYPES = {6, 7, 8, 9}
 AUTH_MODE_BROWSER = "browser"
@@ -162,12 +161,14 @@ def login_platform_type(platform_type: int) -> int:
 
 
 def login_platform_options() -> tuple[tuple[int, str], ...]:
-    """Expose Facebook Page only for the process-local V1 opt-in."""
+    """Return login targets currently offered by the desktop client.
 
-    options = list(LOGIN_PLATFORM_OPTIONS)
-    if facebook_page_v1_enabled():
-        options.append((9, "Facebook Page"))
-    return tuple(options)
+    Paused Meta adapters and their historical account data stay available for
+    audit and possible future recovery, but they are not exposed as login
+    choices until a publish route has completed independent acceptance.
+    """
+
+    return tuple(LOGIN_PLATFORM_OPTIONS)
 
 
 def check_is_fresh(

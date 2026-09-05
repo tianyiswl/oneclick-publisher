@@ -185,12 +185,12 @@ class OverseasAccountEntryTests(unittest.TestCase):
             )
         return result, list(status_queue.queue)
 
-    def test_login_options_keep_instagram_distinct_from_default_off_facebook_page(self) -> None:
+    def test_login_options_keep_supported_overseas_platforms_and_hide_meta(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
             entries = dict(account_service.login_platform_options())
         self.assertEqual(entries[6], "TikTok")
         self.assertEqual(entries[7], "YouTube")
-        self.assertEqual(entries[8], "Instagram Reels")
+        self.assertNotIn(8, entries)
         self.assertNotIn(9, entries)
         self.assertEqual(account_service.login_platform_type(9), 9)
 

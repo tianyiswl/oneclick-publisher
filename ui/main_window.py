@@ -387,9 +387,7 @@ class MainWindow(QMainWindow):
             ("任务记录", self.tasks, "ui/assets/nav-tasks.svg"),
             ("数据监测", self.data_monitor, "ui/assets/nav-dashboard.svg"),
         )
-        self.coming_soon_definitions = (
-            ("海外平台", "ui/assets/nav-publish.svg"),
-        )
+        self.coming_soon_definitions = ()
         self.nav_buttons: list[QPushButton] = []
         self.coming_soon_buttons: list[QPushButton] = []
         self.tabs = QStackedWidget()
@@ -513,24 +511,25 @@ class MainWindow(QMainWindow):
             self.nav_buttons.append(nav_button)
             sidebar_layout.addWidget(nav_button)
 
-        addon_label = QLabel("增值功能")
-        addon_label.setObjectName("navSectionLabel")
-        sidebar_layout.addWidget(addon_label)
-        for label, icon_relative_path in self.coming_soon_definitions:
-            feature_button = QPushButton(f"{label} · 开发中")
-            feature_button.setObjectName("navButton")
-            feature_button.setProperty("navigation", True)
-            feature_button.setProperty("comingSoon", True)
-            feature_button.setIcon(QIcon(str(ROOT_DIR / icon_relative_path)))
-            feature_button.setIconSize(QSize(18, 18))
-            feature_button.setCursor(Qt.CursorShape.PointingHandCursor)
-            feature_button.clicked.connect(
-                lambda _checked=False, feature_name=label: self._show_coming_soon(
-                    feature_name
+        if self.coming_soon_definitions:
+            addon_label = QLabel("增值功能")
+            addon_label.setObjectName("navSectionLabel")
+            sidebar_layout.addWidget(addon_label)
+            for label, icon_relative_path in self.coming_soon_definitions:
+                feature_button = QPushButton(f"{label} · 开发中")
+                feature_button.setObjectName("navButton")
+                feature_button.setProperty("navigation", True)
+                feature_button.setProperty("comingSoon", True)
+                feature_button.setIcon(QIcon(str(ROOT_DIR / icon_relative_path)))
+                feature_button.setIconSize(QSize(18, 18))
+                feature_button.setCursor(Qt.CursorShape.PointingHandCursor)
+                feature_button.clicked.connect(
+                    lambda _checked=False, feature_name=label: self._show_coming_soon(
+                        feature_name
+                    )
                 )
-            )
-            self.coming_soon_buttons.append(feature_button)
-            sidebar_layout.addWidget(feature_button)
+                self.coming_soon_buttons.append(feature_button)
+                sidebar_layout.addWidget(feature_button)
 
         sidebar_layout.addStretch()
         feedback_card = QFrame()

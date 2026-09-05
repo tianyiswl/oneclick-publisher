@@ -124,6 +124,25 @@ class MainWindowShutdownTests(unittest.TestCase):
 
         self.assertEqual(order, ["commerce", "data", "accounts", "global"])
 
+    def test_paused_meta_placeholder_and_empty_addon_heading_are_hidden(self) -> None:
+        """暂停的 Meta 工作不应继续占用客户端导航入口。"""
+
+        window = MainWindow()
+        try:
+            self.assertEqual(window.coming_soon_definitions, ())
+            visible_labels = {
+                label.text()
+                for label in window.findChildren(QLabel)
+                if not label.isHidden()
+            }
+            self.assertNotIn("增值功能", visible_labels)
+            self.assertFalse(
+                any("海外平台" in button.text() for button in window.coming_soon_buttons)
+            )
+        finally:
+            window.accounts.stop_auto_checking()
+            window.deleteLater()
+
     def test_close_event_stops_when_data_monitor_shutdown_fails(self) -> None:
         """数据采集未收束时不得停止账号检测或关闭全局浏览器。"""
 

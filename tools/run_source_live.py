@@ -112,6 +112,7 @@ def main() -> int:
             "media",
             "montage",
             "publish",
+            "douyin_graphic_matrix",
             "commerce",
             "tasks",
             "data",

@@ -131,9 +131,10 @@ class AccountDetectionUiTests(unittest.TestCase):
         self.assertEqual(labels, ["同名 · …1001", "同名 · …1002"])
         self.assertFalse(any("123456" in label for label in labels))
 
-    def test_facebook_page_login_entry_is_hidden_by_default_and_exposed_only_by_opt_in(self) -> None:
+    def test_meta_login_entries_are_hidden_even_when_legacy_flag_is_enabled(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             default_dialog = LoginDialog()
+        self.assertLess(default_dialog.platform_combo.findData(8), 0)
         self.assertLess(default_dialog.platform_combo.findData(9), 0)
         default_dialog.close()
 
@@ -143,7 +144,8 @@ class AccountDetectionUiTests(unittest.TestCase):
             clear=True,
         ):
             enabled_dialog = LoginDialog()
-        self.assertGreaterEqual(enabled_dialog.platform_combo.findData(9), 0)
+        self.assertLess(enabled_dialog.platform_combo.findData(8), 0)
+        self.assertLess(enabled_dialog.platform_combo.findData(9), 0)
         enabled_dialog.close()
 
     def test_facebook_page_business_access_denied_shows_page_permission_guidance(self) -> None:
@@ -958,10 +960,7 @@ class AccountDetectionUiTests(unittest.TestCase):
         window = MainWindow()
         try:
             labels = [label for label, _page, _icon in window.page_definitions]
-            self.assertEqual(
-                labels[3:7],
-                ["自动混剪", "发布中心", "抖音图文矩阵", "抖音带货"],
-            )
+            self.assertEqual(labels[4:7], ["发布中心", "抖音图文矩阵", "抖音带货"])
             window.set_current_page_by_key("douyin_graphic_matrix")
             self.assertIs(window.tabs.currentWidget(), window.douyin_graphic_matrix)
             self.assertEqual(window.current_workspace_label.text(), "抖音图文矩阵")

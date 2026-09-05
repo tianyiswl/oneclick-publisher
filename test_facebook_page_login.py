@@ -459,19 +459,18 @@ class FacebookPageLoginRoutingTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Facebook Page V1"):
                 login_service.start_login(9, "Meta 主体")
 
-    def test_test_only_opt_in_exposes_a_distinct_type_9_login(self) -> None:
-        with (
-            patch.dict(os.environ, {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"}, clear=True),
-            patch.object(login_service.RecoveredOverseasLoginSession, "start") as start,
+    def test_meta_login_options_stay_hidden_even_when_legacy_flag_is_enabled(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"ONECLICK_ENABLE_FACEBOOK_PAGE_V1": "1"},
+            clear=True,
         ):
             options = dict(account_service.login_platform_options())
-            session = login_service.start_login(9, "Meta 主体")
 
-        self.assertEqual(options[8], "Instagram Reels")
-        self.assertEqual(options[9], "Facebook Page")
-        self.assertEqual(account_service.login_platform_type(9), 9)
-        self.assertEqual(session.platform_type, 9)
-        start.assert_called_once_with()
+        self.assertEqual(options[6], "TikTok")
+        self.assertEqual(options[7], "YouTube")
+        self.assertNotIn(8, options)
+        self.assertNotIn(9, options)
 
     def test_direct_page_session_start_rechecks_the_exact_closed_gate(self) -> None:
         session = login_service.RecoveredOverseasLoginSession(9, "Meta 主体")

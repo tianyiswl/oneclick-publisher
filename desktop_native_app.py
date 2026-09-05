@@ -607,8 +607,10 @@ def main() -> int:
             "media",
             "montage",
             "publish",
+            "douyin_graphic_matrix",
             "commerce",
             "tasks",
+            "data",
         ),
         help="启动时直接打开指定工作页，便于本地验收。",
     )
