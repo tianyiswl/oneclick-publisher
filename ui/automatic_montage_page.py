@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""轻量自动混剪与人工文案变体工作页。"""
+"""轻量自动混剪工作页。"""
 
 from __future__ import annotations
 
@@ -17,7 +17,6 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
-    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
@@ -90,13 +89,15 @@ class AutomaticMontagePage(QWidget):
 
         columns = QHBoxLayout()
         columns.setSpacing(12)
-        columns.addWidget(self._build_sources_panel(), 4)
-        columns.addWidget(self._build_settings_panel(), 3)
-        columns.addWidget(self._build_copy_panel(), 4)
+        self.sources_panel = self._build_sources_panel()
+        self.settings_panel = self._build_settings_panel()
+        self.results_panel = self._build_results_panel()
+        columns.addWidget(self.sources_panel, 4)
+        columns.addWidget(self.settings_panel, 3)
+        columns.addWidget(self.results_panel, 5)
         root.addLayout(columns, 3)
 
         root.addWidget(self._build_progress_panel())
-        root.addWidget(self._build_results_panel(), 2)
         self.refresh()
 
     @staticmethod
@@ -244,25 +245,6 @@ class AutomaticMontagePage(QWidget):
         layout.addStretch()
         return panel
 
-    def _build_copy_panel(self) -> QFrame:
-        panel, layout = self._panel()
-        title = QLabel("文案变体（可不填）")
-        title.setObjectName("sectionTitle")
-        layout.addWidget(title)
-        hint = QLabel("用 [今天|这次] 这样的候选组生成不同表达；系统不会擅自改写产品事实。")
-        hint.setProperty("role", "caption")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-        layout.addWidget(QLabel("标题模板"))
-        self.title_template = QLineEdit()
-        self.title_template.setPlaceholderText("例如：[今天|这次]带你看[新品|新款]")
-        layout.addWidget(self.title_template)
-        layout.addWidget(QLabel("正文模板"))
-        self.body_template = ImeAwarePlainTextEdit()
-        self.body_template.setPlaceholderText("例如：重点看看[做工|细节]，喜欢可以收藏。")
-        layout.addWidget(self.body_template, 1)
-        return panel
-
     def _build_progress_panel(self) -> QFrame:
         panel, layout = self._panel()
         row = QHBoxLayout()
@@ -282,16 +264,14 @@ class AutomaticMontagePage(QWidget):
         title = QLabel("生成结果（双击打开视频）")
         title.setObjectName("sectionTitle")
         layout.addWidget(title)
-        self.result_table = QTableWidget(0, 6)
-        self.result_table.setHorizontalHeaderLabels(["结果", "标题", "正文", "时长", "剪辑指纹", "文件"])
+        self.result_table = QTableWidget(0, 4)
+        self.result_table.setHorizontalHeaderLabels(["结果", "时长", "剪辑指纹", "文件"])
         header = self.result_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.result_table.setColumnWidth(0, 78)
-        self.result_table.setColumnWidth(3, 82)
-        self.result_table.setColumnWidth(4, 150)
+        self.result_table.setColumnWidth(1, 82)
+        self.result_table.setColumnWidth(2, 120)
         self.result_table.verticalHeader().setVisible(False)
         self.result_table.setAlternatingRowColors(True)
         self.result_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -405,8 +385,8 @@ class AutomaticMontagePage(QWidget):
                 "audio_mode": self.audio_mode.currentData(),
                 "source_audio_confirmed": self.source_audio_confirmation.isChecked(),
                 "seed": self.seed.value(),
-                "title_template": self.title_template.text(),
-                "body_template": self.body_template.toPlainText(),
+                "title_template": "",
+                "body_template": "",
                 "narration_text": self.narration_text.toPlainText(),
             }
         )
@@ -515,25 +495,24 @@ class AutomaticMontagePage(QWidget):
                 0,
                 table_item("成功" if success else "失败", COLORS["success"] if success else COLORS["danger"]),
             )
-            self.result_table.setItem(row, 1, table_item(output.get("title") or output.get("error") or ""))
-            body_item = table_item(output.get("body") or "")
-            body_item.setToolTip(str(output.get("body") or ""))
-            self.result_table.setItem(row, 2, body_item)
+            status_item = self.result_table.item(row, 0)
+            if status_item is not None and not success:
+                status_item.setToolTip(str(output.get("error") or ""))
             duration_ms = int(output.get("duration_ms") or 0)
-            self.result_table.setItem(row, 3, table_item(f"{duration_ms / 1000:g} 秒" if duration_ms else "—"))
+            self.result_table.setItem(row, 1, table_item(f"{duration_ms / 1000:g} 秒" if duration_ms else "—"))
             fingerprint = str(output.get("fingerprint") or "")
             fingerprint_item = table_item(fingerprint[:12] if fingerprint else "—")
             fingerprint_item.setToolTip(fingerprint)
-            self.result_table.setItem(row, 4, fingerprint_item)
+            self.result_table.setItem(row, 2, fingerprint_item)
             output_path = str(output.get("output_path") or "")
             file_item = table_item(Path(output_path).name if output_path else "—")
             file_item.setData(Qt.ItemDataRole.UserRole, output_path)
             file_item.setToolTip(output_path)
-            self.result_table.setItem(row, 5, file_item)
+            self.result_table.setItem(row, 3, file_item)
             self.result_table.setRowHeight(row, 38)
 
     def open_result_video(self, row: int, _column: int) -> None:
-        item = self.result_table.item(row, 5)
+        item = self.result_table.item(row, 3)
         path = str(item.data(Qt.ItemDataRole.UserRole) or "") if item else ""
         if path and Path(path).is_file():
             open_path(path)

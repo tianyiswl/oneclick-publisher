@@ -128,8 +128,6 @@ class AutomaticMontagePageTests(unittest.TestCase):
         assert confirmation is not None
         confirmation.setChecked(True)
         page.seed.setValue(123)
-        page.title_template.setText("[今天|这次]看新品")
-        page.body_template.setPlainText("重点看[做工|细节]")
 
         request = page.build_request()
         self.assertEqual(request.source_paths, (self.video_a.resolve(),))
@@ -140,6 +138,24 @@ class AutomaticMontagePageTests(unittest.TestCase):
         self.assertEqual(request.audio_mode, "source")
         self.assertTrue(request.source_audio_confirmed)
         self.assertEqual(request.seed, 123)
+        self.assertEqual(request.title_template, "")
+        self.assertEqual(request.body_template, "")
+
+    def test_results_replace_copy_editor_as_third_column(self) -> None:
+        page = self.page()
+
+        columns = page.layout().itemAt(1).layout()
+        self.assertIsNotNone(columns)
+        assert columns is not None
+        self.assertEqual(columns.count(), 3)
+        self.assertIs(columns.itemAt(2).widget(), page.results_panel)
+        self.assertFalse(hasattr(page, "title_template"))
+        self.assertFalse(hasattr(page, "body_template"))
+        self.assertEqual(page.result_table.columnCount(), 4)
+        self.assertEqual(
+            [page.result_table.horizontalHeaderItem(index).text() for index in range(4)],
+            ["结果", "时长", "剪辑指纹", "文件"],
+        )
 
     def test_source_audio_is_ambient_only_and_confirmation_resets_with_sources(self) -> None:
         page = self.page()
@@ -278,7 +294,8 @@ class AutomaticMontagePageTests(unittest.TestCase):
 
         self.assertEqual(page.result_table.rowCount(), 1)
         self.assertEqual(page.result_table.item(0, 0).text(), "成功")
-        self.assertEqual(page.result_table.item(0, 2).text(), "正文内容")
+        self.assertEqual(page.result_table.item(0, 1).text(), "5 秒")
+        self.assertEqual(page.result_table.item(0, 3).text(), "video.mp4")
         self.assertEqual(page.progress_bar.value(), 100)
         self.assertTrue(page.open_output_button.isEnabled())
 
