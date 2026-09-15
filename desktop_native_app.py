@@ -233,6 +233,28 @@ def run_controlled_publish_cli(args: argparse.Namespace) -> int:
     ensure_schema()
     action = str(args.controlled_publish_action or "")
     try:
+        if action == "batch-check":
+            from app_core.video_batch_service import check_batch
+            if not args.controlled_publish_request:
+                raise ValueError("批量检查需要 JSON 请求文件")
+            _controlled_json(check_batch(_read_controlled_request(args.controlled_publish_request)))
+            return 0
+        if action == "batch-prepare":
+            from app_core.video_batch_service import prepare_and_store
+            if not args.controlled_publish_request:
+                raise ValueError("批量准备需要 JSON 请求文件")
+            _controlled_json(prepare_and_store(_read_controlled_request(args.controlled_publish_request)))
+            return 0
+        if action in {"batch-status", "batch-cancel"}:
+            from app_core.video_batch_service import batch_status, cancel_batch
+            if not args.controlled_publish_batch_id:
+                raise ValueError("批次操作需要 batch id")
+            result = batch_status(args.controlled_publish_batch_id) if action == "batch-status" else cancel_batch(args.controlled_publish_batch_id)
+            _controlled_json(result)
+            return 0
+        if action in {"batch-authorize", "batch-start"}:
+            from app_core.video_batch_service import authorize_batch, start_batch
+            (authorize_batch if action == "batch-authorize" else start_batch)()
         if action in {"metrics-sync", "metrics-get", "metrics-status"}:
             from app_core.content_project_gateway import ContentProjectGateway
 
@@ -642,6 +664,12 @@ def main() -> int:
             "silicon-formal",
             "silicon-direct",
             "matrix",
+            "batch-check",
+            "batch-prepare",
+            "batch-status",
+            "batch-cancel",
+            "batch-authorize",
+            "batch-start",
             "metrics-sync",
             "metrics-get",
             "metrics-status",
@@ -660,6 +688,10 @@ def main() -> int:
         "--controlled-publish-task-id",
         type=int,
         metavar="TASK_ID",
+    )
+    parser.add_argument(
+        "--controlled-publish-batch-id",
+        metavar="BATCH_ID",
     )
     parser.add_argument(
         "--controlled-publish-authorization-id",

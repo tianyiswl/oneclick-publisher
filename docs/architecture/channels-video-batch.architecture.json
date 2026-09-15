@@ -1,0 +1,23 @@
+{
+ "schema_version":1,"diagram_type":"architecture",
+ "meta":{"title":"视频号批量发布：目标架构","quality_profile":"showcase","viewBox":[1160,660]},
+ "components":[
+  {"id":"input","type":"frontend","label":"桌面与 CLI","sublabel":"素材、通用内容、覆盖","pos":[40,180],"size":[190,80]},
+  {"id":"contract","type":"backend","label":"批次服务","sublabel":"本地校验与冻结快照","pos":[330,180],"size":[190,80]},
+  {"id":"authorization","type":"security","label":"用户确认","sublabel":"绑定内容、账号、排期","pos":[620,180],"size":[190,80]},
+  {"id":"executor","type":"backend","label":"串行执行器","sublabel":"干净编辑页、单次提交","pos":[910,180],"size":[190,80]},
+  {"id":"store","type":"database","label":"任务与逐条状态","sublabel":"租约、指纹、提交意图","pos":[330,420],"size":[190,80]},
+  {"id":"recovery","type":"backend","label":"暂停与只读核对","sublabel":"结果不明禁止重放","pos":[620,420],"size":[190,80]},
+  {"id":"platform","type":"external","label":"视频号适配器","sublabel":"验证提示与平台回执","pos":[910,420],"size":[190,80]}
+ ],
+ "connections":[
+  {"from":"input","to":"contract","label":"填写"},
+  {"from":"contract","to":"authorization","label":"快照"},
+  {"from":"authorization","to":"executor","label":"授权"},
+  {"from":"contract","to":"store","label":"持久化","labelDy":60},
+  {"from":"executor","to":"platform","label":"逐条执行","labelDy":60},
+  {"from":"platform","to":"recovery","label":"核对结果"},
+  {"from":"recovery","to":"store","label":"记录状态"}
+ ],
+ "cards":[{"dot":"amber","title":"恢复规则","items":["明确失败：新确认后重试；验证：同会话续跑","成功：不重复提交；结果不明：先只读核对"]}]
+}

@@ -570,6 +570,9 @@ class TaskPage(QWidget):
         self.result_label.setProperty("role", "countBadge")
         header_row.addWidget(self.result_label)
         header_row.addStretch()
+        self.video_batch_history_button = button("视频号本地批次", variant="secondary")
+        self.video_batch_history_button.clicked.connect(self.open_video_batch_history)
+        header_row.addWidget(self.video_batch_history_button)
         self.select_all_checkbox = QCheckBox("全选")
         self.select_all_checkbox.toggled.connect(self.set_all_checked)
         header_row.addWidget(self.select_all_checkbox)
@@ -645,6 +648,10 @@ class TaskPage(QWidget):
         self.table.cellDoubleClicked.connect(lambda row, _col: self.open_detail(row))
         layout.addWidget(self.table)
         self.refresh()
+
+    def open_video_batch_history(self) -> None:
+        from .video_batch_history import VideoBatchHistoryDialog
+        VideoBatchHistoryDialog(self).exec()
 
     def refresh(self) -> None:
         self.all_rows = task_service.list_tasks()

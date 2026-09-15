@@ -531,6 +531,9 @@ class PublishPage(QWidget):
 
         root_layout = QVBoxLayout(self)
         root_layout.setContentsMargins(0, 0, 0, 0)
+        batch_button = QPushButton("单平台批量视频（视频号）")
+        batch_button.clicked.connect(self.open_video_batch)
+        root_layout.addWidget(batch_button)
         self.workflow_stack = QStackedWidget()
         root_layout.addWidget(self.workflow_stack)
         self.type_selector_page = self._build_content_type_selector()
@@ -3193,6 +3196,10 @@ class PublishPage(QWidget):
             "抖音账号已变更，请重新搜索并选择发布定位",
             "warning",
         )
+
+    def open_video_batch(self) -> None:
+        from .video_batch_page import VideoBatchDialog
+        VideoBatchDialog(self).exec()
 
     def refresh_platform_navigation(self) -> None:
         current_item = self.platform_nav.currentItem()
